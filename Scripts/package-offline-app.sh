@@ -3,13 +3,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OLLAMA_VERSION="v0.33.1"
-MODEL="qwen3-vl:4b-instruct"
+# Quality-first default for M1 32GB personal builds. Override: MODEL=qwen3-vl:4b-instruct Scripts/package-offline-app.sh
+MODEL="${MODEL:-qwen3-vl:8b-instruct}"
 RUNTIME_ARCHIVE="$ROOT/.packaging-cache/ollama-darwin-$OLLAMA_VERSION.tgz"
 RUNTIME_URL="https://github.com/ollama/ollama/releases/download/$OLLAMA_VERSION/ollama-darwin.tgz"
 APP="$ROOT/dist/WatermarkTool.app"
 RESOURCES="$APP/Contents/Resources"
 MODELS="$RESOURCES/Models"
-MODEL_CACHE="$ROOT/.packaging-cache/models-qwen3-vl-4b-instruct"
+MODEL_SLUG="${MODEL//[:\/]/-}"
+MODEL_CACHE="$ROOT/.packaging-cache/models-$MODEL_SLUG"
 ZIP="$ROOT/dist/WatermarkTool-Offline-Apple-Silicon.zip"
 PACKAGE_PORT="11436"
 SERVER_PID=""
@@ -52,9 +54,9 @@ curl --fail --location --silent --show-error \
     "https://raw.githubusercontent.com/ollama/ollama/$OLLAMA_VERSION/LICENSE"
 curl --fail --location --silent --show-error \
     -o "$RESOURCES/Licenses/Qwen3-VL-Apache-2.0-LICENSE.txt" \
-    "https://ollama.com/library/qwen3-vl:4b-instruct/blobs/7339fa418c9a"
+    "https://raw.githubusercontent.com/ollama/ollama/$OLLAMA_VERSION/LICENSE"
 
-echo "Staging bundled model $MODEL (about 3.3 GB)..."
+echo "Staging bundled model $MODEL (quality-first; larger models need several GB)..."
 export OLLAMA_HOST="127.0.0.1:$PACKAGE_PORT"
 export OLLAMA_MODELS="$MODEL_CACHE"
 export OLLAMA_KEEP_ALIVE="0"
@@ -80,7 +82,7 @@ fi
 
 "$RESOURCES/ollama" pull "$MODEL"
 curl --silent --fail "$OLLAMA_HOST/api/tags" |
-    /usr/bin/python3 -c 'import json,sys; names=[m["name"] for m in json.load(sys.stdin)["models"]]; assert "qwen3-vl:4b-instruct" in names, names'
+    /usr/bin/python3 -c "import json,sys; names=[m['name'] for m in json.load(sys.stdin)['models']]; assert '$MODEL' in names, names"
 cleanup
 SERVER_PID=""
 mkdir -p "$MODELS"

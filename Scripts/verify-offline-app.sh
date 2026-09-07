@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="${1:-$ROOT/dist/WatermarkTool.app}"
 RESOURCES="$APP/Contents/Resources"
-MODEL="qwen3-vl:4b-instruct"
+MODEL="${MODEL:-qwen3-vl:8b-instruct}"
 PORT="11437"
 TEMP="$(mktemp -d)"
 RUNTIME_LOG="$ROOT/.packaging-cache/verify-ollama.log"
@@ -48,11 +48,11 @@ for _ in {1..100}; do
     sleep 0.2
 done
 test "$READY" = "1"
-/usr/bin/python3 - "$TEMP/tags.json" <<'PY'
+/usr/bin/python3 - "$TEMP/tags.json" "$MODEL" <<'PY'
 import json, sys
 with open(sys.argv[1]) as handle:
     names = [model["name"] for model in json.load(handle)["models"]]
-assert "qwen3-vl:4b-instruct" in names, names
+assert sys.argv[2] in names, names
 PY
 
 /usr/bin/python3 - "$TEMP/test.ppm" <<'PY'
@@ -67,7 +67,7 @@ PY
 sips -s format jpeg "$TEMP/test.ppm" --out "$TEMP/test.jpg" >/dev/null
 base64 -i "$TEMP/test.jpg" -o "$TEMP/image.b64"
 
-/usr/bin/python3 - "$TEMP/image.b64" "$TEMP/request.json" <<'PY'
+/usr/bin/python3 - "$TEMP/image.b64" "$TEMP/request.json" "$MODEL" <<'PY'
 import json, sys
 with open(sys.argv[1]) as handle:
     image = handle.read().replace("\n", "")
@@ -80,7 +80,7 @@ schema = {
     "additionalProperties": False,
 }
 request = {
-    "model": "qwen3-vl:4b-instruct",
+    "model": sys.argv[3],
     "prompt": "Does this image contain blue? Return only the requested JSON.",
     "images": [image],
     "stream": False,

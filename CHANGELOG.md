@@ -2,44 +2,31 @@
 
 All notable versions of **AI-autoenhance-watermark** (Watermark Tool).
 
-## 2026.09.07 — snapshot (pending AI quality work)
+## Unreleased — enhancer-v3 quality-first (M1 32GB personal)
 
-**Status:** frozen baseline before enhancer redesign. No AI-quality fixes in this tag yet.
+**Status:** source updated for quality-over-speed personal Nikon Z6 use.
 
-### Shipped in this version
+### Changes
 
-- Native macOS SwiftUI batch watermark app (`Sources/WatermarkToolApp.swift`)
-- Watermark controls: text, font, corner, direction, opacity, height, bottom offset
-- **Auto-enhance:** measured, bounded Core Image exposure (≤ 0.35 EV) and shadow lift (≤ 0.28); RawTherapee CLI path for RAW when installed
-- **AI analysis (optional):** bundled Ollama + `qwen3-vl:4b-instruct` on localhost `11435`; scene/lighting classification only; gates the measured plan
-- **AI subject enhancement (optional):** Vision foreground mask + Apple `autoAdjustmentFilters` on subject
-- Batch safety: one image at a time, resume via `.watermark-status.json`, work log, AI analysis cache
-- Offline packaging scripts (`Scripts/package-offline-app.sh`, `Scripts/verify-offline-app.sh`)
+- **Quality first mode (default on):** slow batches OK; utility/background QoS; Ollama uses half the CPU threads + `nice`-style priority so other Mac work stays usable
+- **Larger local VL default:** `qwen3-vl:8b-instruct` (falls back to `4b-instruct` if missing); editable model tag in UI; 10-minute→60-minute keep-alive; up to 600s AI attempts
+- **ISO-aware denoise** before tone (Core Image), tuned for Z6 high-ISO NEFs
+- **Full AI analysis default** (`All images`); larger 1536px analysis preview when quality-first
+- **After RawTherapee:** gentle measured polish still runs in quality-first (no longer skip CI entirely)
+- **Export defaults:** JPEG 95%, Compressed JPEG output for NEF-friendly personal batches
+- Offline package defaults to 8b instruct (`MODEL=qwen3-vl:4b-instruct` still overrides)
 
-### Documented investigation (not yet implemented)
+## Unreleased — enhancer-v2 (AI quality + stronger batch enhance)
 
-Investigation on 2026-09-07 found why AI-edited results often look worse than non-AI auto-enhance:
+Superseded by enhancer-v3 quality-first above for personal use priorities.
 
-1. **AI subject enhancement** uses unbounded `CIImage.autoAdjustmentFilters(options: nil)` — opaque WB/contrast/color edits, unlike the capped measured path.
-2. **Subject/background discontinuity** — subject is graded differently from the rest; mask is not feathered.
-3. **Double processing** when both auto-enhance and AI subject enhancement are on.
-4. **AI analysis hard-gates** the plan (`minimal` / `preserve_stage_lighting` / `review` can zero exposure and shadow lift) instead of softly biasing measurements.
-5. **`preserveColor` is computed but never applied** by the renderer.
-6. Highlight adjust still runs when auto-enhance is on even if shadow lift is zero; final export is always 8-bit sRGB (JPEG default quality 0.85).
-7. UI copy oversells auto-enhance (“contrast, color, and sharpness”); code only does exposure + highlight/shadow.
+### Changes
 
-### Pending changes (next version)
+- Stronger measured auto-enhance; soft AI gating; preserveColor; feathered subject path; no `autoAdjustmentFilters` stacking
 
-Hold implementation until after this snapshot. Planned work:
+## 2026.09.07 — snapshot
 
-- [ ] Replace Vision `autoAdjustmentFilters` with the same (or gentler) bounded measured plan on the subject only
-- [ ] Feather / soften the subject mask before blend
-- [ ] Avoid stacking: subject path + global auto-enhance should not double-tone
-- [ ] Soften AI analysis gating: bias the plan instead of muting enhancement on `minimal` / misclassified treatments
-- [ ] Honor `preserveColor` / `preserve_stage_lighting` in the renderer
-- [ ] Skip or reduce highlight adjust when no shadow lift is planned
-- [ ] Align UI captions with what each toggle actually does
-- [ ] Optional: higher bit-depth / color-managed path before watermark encode
+Frozen baseline tag `v2026.09.07`. See git history for details.
 
 ### Links
 

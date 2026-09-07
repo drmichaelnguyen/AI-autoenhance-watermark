@@ -5,6 +5,7 @@ import ImageIO
 import UniformTypeIdentifiers
 import Vision
 import Foundation
+import Darwin
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
@@ -51,7 +52,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Watermark Tool")
                     .font(.system(size: 24, weight: .semibold, design: .rounded))
-                Text("Batch mark images while keeping originals untouched")
+                Text("Quality-first local batch for Nikon NEF — slow OK, Mac stays usable")
                     .foregroundStyle(.secondary)
                     .font(.subheadline)
             }
@@ -184,12 +185,16 @@ struct ContentView: View {
             Text("Height above the bottom edge. Used for either bottom corner.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Toggle("Quality first (slow, low system impact)", isOn: $model.qualityFirst)
+            Text("Prefer best output over speed: ISO denoise, full AI analysis, larger VL model, background CPU/GPU priority so other Mac work stays responsive. Batches may take hours.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Toggle("Auto-enhance image", isOn: $model.autoEnhance)
-            Text("Balances exposure, contrast, color, and sharpness before adding the watermark.")
+            Text("Measured local exposure, shadows, contrast, vibrance, and sharpening (bounded; originals untouched).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Toggle("AI subject enhancement", isOn: $model.aiSubjectEnhance)
-            Text("Detects the foreground subject and enhances it without changing the background.")
+            Text("Vision finds the subject; the same bounded plan is applied only there with a soft feathered mask.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             LabeledContent("JPEG quality") {
@@ -221,15 +226,13 @@ struct ContentView: View {
                     Text(mode.label).tag(mode)
                 }
             }
-            Text("Uses Ollama only for scene classification. Pixel adjustments remain bounded and measurement-driven.")
+            Text("Local Ollama classifies scene/lighting and softly biases the measured plan—no cloud calls, no free-form edits.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             if model.analysisMode != .off {
-                LabeledContent("Bundled model") {
-                    Text(model.ollamaModel)
-                        .foregroundStyle(.secondary)
-                }
-                Text("Runs entirely inside this app. Invalid output automatically falls back to measured adjustments.")
+                TextField("Local VL model tag", text: $model.ollamaModel)
+                    .textFieldStyle(.roundedBorder)
+                Text("Quality default: qwen3-vl:8b-instruct (falls back to 4b if missing). Instruct only—avoid thinking variants. Invalid JSON falls back to measured edits.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -395,12 +398,13 @@ final class WatermarkModel {
     var opacity = 0.72
     var heightPercent = 5.0
     var bottomOffsetPercent = 2.5
-    var jpegQuality = 0.85
-    var outputFormat = OutputFormat.original
-    var autoEnhance = false
-    var aiSubjectEnhance = false
-    var analysisMode = AnalysisMode.off
-    var ollamaModel = "qwen3-vl:4b-instruct"
+    var jpegQuality = 0.95
+    var outputFormat = OutputFormat.jpeg
+    var autoEnhance = true
+    var aiSubjectEnhance = true
+    var qualityFirst = true
+    var analysisMode = AnalysisMode.all
+    var ollamaModel = EmbeddedOllamaManager.preferredModel
     var inputFolder: URL?
     var outputFolder: URL?
     var previewImage: NSImage?
@@ -517,11 +521,16 @@ final class WatermarkModel {
         }
         logURL = workLog.url
         logEntries = []
-        let settings = RenderSettings(text: text, fontName: fontName, corner: corner, direction: direction, opacity: opacity, heightPercent: heightPercent, bottomOffsetPercent: bottomOffsetPercent, jpegQuality: jpegQuality, outputFormat: outputFormat, autoEnhance: autoEnhance, aiSubjectEnhance: aiSubjectEnhance, analysisMode: analysisMode, ollamaModel: ollamaModel)
-        DispatchQueue.global(qos: .userInitiated).async {
+        let settings = RenderSettings(text: text, fontName: fontName, corner: corner, direction: direction, opacity: opacity, heightPercent: heightPercent, bottomOffsetPercent: bottomOffsetPercent, jpegQuality: jpegQuality, outputFormat: outputFormat, autoEnhance: autoEnhance, aiSubjectEnhance: aiSubjectEnhance, qualityFirst: qualityFirst, analysisMode: analysisMode, ollamaModel: ollamaModel)
+        let queue = DispatchQueue.global(qos: settings.qualityFirst ? .utility : .userInitiated)
+        queue.async {
+            if settings.qualityFirst {
+                // Leave interactive Mac work responsive while this batch runs for hours.
+                Thread.current.qualityOfService = .utility
+            }
             var completed = 0
             var failures = 0
-            workLog.add("Batch started: \(files.count) image(s), AI \(settings.analysisMode.label), model \(settings.ollamaModel)")
+            workLog.add("Batch started: \(files.count) image(s), qualityFirst=\(settings.qualityFirst), AI \(settings.analysisMode.label), model \(settings.ollamaModel)")
             for file in files {
                 if cancellationToken.isCancelled { break }
                 do {
@@ -589,6 +598,7 @@ struct RenderSettings: Sendable {
     let outputFormat: OutputFormat
     let autoEnhance: Bool
     let aiSubjectEnhance: Bool
+    let qualityFirst: Bool
     let analysisMode: AnalysisMode
     let ollamaModel: String
 }
@@ -644,9 +654,44 @@ struct ImageMetrics: Sendable {
 struct EnhancementPlan: Sendable {
     let exposureStops: Double
     let shadowLift: Double
+    let highlightAmount: Double
+    let contrastAmount: Double
+    let vibranceAmount: Double
+    let sharpenAmount: Double
     let protectHighlights: Bool
     let preserveColor: Bool
     let review: Bool
+
+    static let identity = EnhancementPlan(
+        exposureStops: 0,
+        shadowLift: 0,
+        highlightAmount: 0,
+        contrastAmount: 0,
+        vibranceAmount: 0,
+        sharpenAmount: 0,
+        protectHighlights: false,
+        preserveColor: false,
+        review: false
+    )
+
+    func scaled(by factor: Double) -> EnhancementPlan {
+        EnhancementPlan(
+            exposureStops: exposureStops * factor,
+            shadowLift: shadowLift * factor,
+            highlightAmount: highlightAmount * factor,
+            contrastAmount: contrastAmount * factor,
+            vibranceAmount: vibranceAmount * factor,
+            sharpenAmount: sharpenAmount * factor,
+            protectHighlights: protectHighlights,
+            preserveColor: preserveColor,
+            review: review
+        )
+    }
+
+    var hasAdjustments: Bool {
+        exposureStops > 0.001 || shadowLift > 0.001 || highlightAmount > 0.001
+            || contrastAmount > 0.001 || vibranceAmount > 0.001 || sharpenAmount > 0.001
+    }
 }
 
 final class WorkLog: @unchecked Sendable {
@@ -691,12 +736,17 @@ final class WorkLog: @unchecked Sendable {
 
 final class EmbeddedOllamaManager: @unchecked Sendable {
     static let shared = EmbeddedOllamaManager()
-    static let bundledModel = "qwen3-vl:4b-instruct"
+    /// Quality-first default for M1 32GB personal use. Falls back to 4b if not staged.
+    static let preferredModel = "qwen3-vl:8b-instruct"
+    static let fallbackModel = "qwen3-vl:4b-instruct"
+    static let knownModels = [preferredModel, fallbackModel]
+    static let bundledModel = preferredModel
     static let baseURL = URL(string: "http://127.0.0.1:11435")!
 
     private let lock = NSLock()
     private var process: Process?
     private var runtimeLogHandle: FileHandle?
+    private var requiredModelName = preferredModel
 
     private init() {}
 
@@ -707,11 +757,15 @@ final class EmbeddedOllamaManager: @unchecked Sendable {
             .appendingPathComponent("embedded-ollama.log")
     }
 
-    func ensureRunning(timeout: TimeInterval = 20, log: WorkLog? = nil) -> Result<URL, Error> {
+    func ensureRunning(timeout: TimeInterval = 90, requiredModel: String? = nil, log: WorkLog? = nil) -> Result<URL, Error> {
         lock.lock()
         defer { lock.unlock() }
 
-        if process?.isRunning == true, isHealthy() {
+        if let requiredModel, !requiredModel.isEmpty {
+            requiredModelName = requiredModel
+        }
+
+        if process?.isRunning == true, isHealthy(requiredModel: requiredModelName) {
             return .success(Self.baseURL)
         }
 
@@ -735,17 +789,23 @@ final class EmbeddedOllamaManager: @unchecked Sendable {
             process.executableURL = executable
             process.arguments = ["serve"]
             process.currentDirectoryURL = executable.deletingLastPathComponent()
+            process.qualityOfService = .background
             var environment = ProcessInfo.processInfo.environment
             environment["OLLAMA_HOST"] = "127.0.0.1:11435"
             environment["OLLAMA_MODELS"] = models.path
-            environment["OLLAMA_KEEP_ALIVE"] = "10m"
+            environment["OLLAMA_KEEP_ALIVE"] = "60m"
             environment["OLLAMA_NUM_PARALLEL"] = "1"
+            environment["OLLAMA_MAX_LOADED_MODELS"] = "1"
+            // Leave roughly half the cores free for other Mac work during long batches.
+            let cores = max(2, ProcessInfo.processInfo.activeProcessorCount / 2)
+            environment["OLLAMA_NUM_THREAD"] = String(cores)
             process.environment = environment
             process.standardOutput = runtimeLogHandle
             process.standardError = runtimeLogHandle
             try process.run()
             self.process = process
-            log?.add("Bundled AI runtime started (PID \(process.processIdentifier)); runtime log: \(runtimeLogURL.path)")
+            setpriority(PRIO_PROCESS, Int32(process.processIdentifier), 15)
+            log?.add("Bundled AI runtime started (PID \(process.processIdentifier), background QoS, \(cores) threads); runtime log: \(runtimeLogURL.path)")
         } catch {
             stopLocked()
             let wrapped = LocalAIError.runtimeStartFailed(error.localizedDescription)
@@ -761,8 +821,8 @@ final class EmbeddedOllamaManager: @unchecked Sendable {
                 stopLocked()
                 return .failure(error)
             }
-            if isHealthy() {
-                log?.add("Bundled AI is ready on private localhost port 11435")
+            if isHealthy(requiredModel: requiredModelName) {
+                log?.add("Bundled AI is ready on private localhost port 11435 (model \(resolvedAvailableModel(preferred: requiredModelName) ?? requiredModelName))")
                 return .success(Self.baseURL)
             }
             Thread.sleep(forTimeInterval: 0.2)
@@ -780,6 +840,17 @@ final class EmbeddedOllamaManager: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Prefer the requested tag; otherwise first known instruct model present in the bundle.
+    func resolvedAvailableModel(preferred: String) -> String? {
+        guard let tags = fetchTags() else { return nil }
+        let names = Set(tags.models.map(\.name))
+        if names.contains(preferred) { return preferred }
+        for candidate in Self.knownModels where names.contains(candidate) {
+            return candidate
+        }
+        return tags.models.first?.name
+    }
+
     private var bundledExecutableURL: URL? {
         Bundle.main.resourceURL?.appendingPathComponent("ollama")
     }
@@ -788,21 +859,25 @@ final class EmbeddedOllamaManager: @unchecked Sendable {
         Bundle.main.resourceURL?.appendingPathComponent("Models", isDirectory: true)
     }
 
-    private func isHealthy() -> Bool {
+    private func isHealthy(requiredModel: String) -> Bool {
+        resolvedAvailableModel(preferred: requiredModel) != nil
+    }
+
+    private func fetchTags() -> OllamaTagsResponse? {
         var request = URLRequest(url: Self.baseURL.appendingPathComponent("api/tags"))
-        request.timeoutInterval = 1
+        request.timeoutInterval = 2
         let semaphore = DispatchSemaphore(value: 0)
         let box = SynchronousDataBox()
         URLSession.shared.dataTask(with: request) { data, response, error in
             box.store(data: data, statusCode: (response as? HTTPURLResponse)?.statusCode, error: error)
             semaphore.signal()
         }.resume()
-        guard semaphore.wait(timeout: .now() + 1) == .success,
+        guard semaphore.wait(timeout: .now() + 2) == .success,
               box.error == nil, box.statusCode == 200, let data = box.data,
               let tags = try? JSONDecoder().decode(OllamaTagsResponse.self, from: data) else {
-            return false
+            return nil
         }
-        return tags.models.contains { $0.name == Self.bundledModel }
+        return tags
     }
 
     private func prepareRuntimeLog() throws {
@@ -828,15 +903,16 @@ final class EmbeddedOllamaManager: @unchecked Sendable {
 }
 
 enum LocalAIAnalyzer {
-    static let promptVersion = "scene-analysis-v1"
+    static let promptVersion = "scene-analysis-v3-quality"
 
     static func testConnection(model: String, completion: @escaping @Sendable (Result<String, Error>) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            switch EmbeddedOllamaManager.shared.ensureRunning() {
+        DispatchQueue.global(qos: .utility).async {
+            switch EmbeddedOllamaManager.shared.ensureRunning(timeout: 120, requiredModel: model) {
             case .failure(let error):
                 completion(.failure(error))
             case .success:
-                completion(.success("Bundled local AI is ready: \(model)."))
+                let resolved = EmbeddedOllamaManager.shared.resolvedAvailableModel(preferred: model) ?? model
+                completion(.success("Bundled local AI is ready: \(resolved)."))
             }
         }
     }
@@ -857,37 +933,46 @@ enum LocalAIAnalyzer {
             log.add("\(file.lastPathComponent): AI cache hit — \(cached.sceneCategory.rawValue), \(cached.recommendedTreatment.rawValue)")
             return cached
         }
-        guard let preview = previewJPEG(image) else {
+        let previewMax = settings.qualityFirst ? 1536.0 : 1024.0
+        guard let preview = previewJPEG(image, maxDimension: previewMax) else {
             log.add("\(file.lastPathComponent): AI fallback (could not create preview)")
             return nil
         }
-        let request = OllamaRequest(
-            model: settings.ollamaModel.isEmpty ? EmbeddedOllamaManager.bundledModel : settings.ollamaModel,
-            prompt: "Classify this consistently developed event photograph. Return only the requested JSON. Do not suggest pixel masks or numeric edits.",
-            images: [preview.base64EncodedString()],
-            stream: false,
-            format: schema,
-            options: ["temperature": 0.0, "top_p": 0.1, "seed": 17, "num_predict": 160],
-            keepAlive: "10m"
-        )
-        guard let body = try? JSONEncoder().encode(request) else {
-            log.add("\(file.lastPathComponent): AI fallback (request encoding failed)")
-            return nil
-        }
+        let preferredModel = settings.ollamaModel.isEmpty ? EmbeddedOllamaManager.preferredModel : settings.ollamaModel
+        let startupTimeout: TimeInterval = settings.qualityFirst ? 180 : 90
         let baseURL: URL
-        switch EmbeddedOllamaManager.shared.ensureRunning(log: log) {
+        switch EmbeddedOllamaManager.shared.ensureRunning(timeout: startupTimeout, requiredModel: preferredModel, log: log) {
         case .success(let url):
             baseURL = url
         case .failure(let error):
             log.add("\(file.lastPathComponent): AI unavailable — \(error.localizedDescription); using measurement-only fallback")
             return nil
         }
+        let model = EmbeddedOllamaManager.shared.resolvedAvailableModel(preferred: preferredModel) ?? preferredModel
+        if model != preferredModel {
+            log.add("\(file.lastPathComponent): requested model \(preferredModel) missing; using \(model)")
+        }
+        let request = OllamaRequest(
+            model: model,
+            prompt: "Classify this consistently developed event photograph (Nikon Z6 style). Return only the requested JSON. Do not suggest pixel masks or numeric edits.",
+            images: [preview.base64EncodedString()],
+            stream: false,
+            format: schema,
+            options: ["temperature": 0.0, "top_p": 0.1, "seed": 17, "num_predict": 200],
+            keepAlive: settings.qualityFirst ? "60m" : "10m"
+        )
+        guard let body = try? JSONEncoder().encode(request) else {
+            log.add("\(file.lastPathComponent): AI fallback (request encoding failed)")
+            return nil
+        }
         let endpoint = baseURL.appendingPathComponent("api/generate")
-        for attempt in 1...2 {
-            log.add("\(file.lastPathComponent): asking local AI (attempt \(attempt)/2)")
+        let attemptTimeout: TimeInterval = settings.qualityFirst ? 600 : 180
+        let attempts = settings.qualityFirst ? 3 : 2
+        for attempt in 1...attempts {
+            log.add("\(file.lastPathComponent): asking local AI \(model) (attempt \(attempt)/\(attempts), timeout \(Int(attemptTimeout))s)")
             var urlRequest = URLRequest(url: endpoint)
             urlRequest.httpMethod = "POST"
-            urlRequest.timeoutInterval = 180
+            urlRequest.timeoutInterval = attemptTimeout
             urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
             urlRequest.httpBody = body
             let semaphore = DispatchSemaphore(value: 0)
@@ -896,7 +981,7 @@ enum LocalAIAnalyzer {
                 responseBox.store(data: data, statusCode: (response as? HTTPURLResponse)?.statusCode, error: error)
                 semaphore.signal()
             }.resume()
-            guard semaphore.wait(timeout: .now() + 181) == .success else {
+            guard semaphore.wait(timeout: .now() + attemptTimeout + 1) == .success else {
                 log.add("\(file.lastPathComponent): AI attempt \(attempt) timed out")
                 continue
             }
@@ -935,21 +1020,20 @@ enum LocalAIAnalyzer {
         "additionalProperties": AnyCodable(false)
     ]
 
-    private static func previewJPEG(_ image: CGImage) -> Data? {
-        let maxDimension = 1024.0
+    private static func previewJPEG(_ image: CGImage, maxDimension: Double = 1024) -> Data? {
         let scale = min(1, maxDimension / Double(max(image.width, image.height)))
         let ciImage = CIImage(cgImage: image).transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         let context = CIContext(options: [.useSoftwareRenderer: false])
         guard let preview = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(destination, preview, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
+        CGImageDestinationAddImage(destination, preview, [kCGImageDestinationLossyCompressionQuality: 0.92] as CFDictionary)
         return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
 
     private static func cacheKey(file: URL, settings: RenderSettings) -> String {
         let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        return [file.path, String(values?.fileSize ?? 0), String(describing: values?.contentModificationDate ?? .distantPast), settings.ollamaModel, promptVersion].joined(separator: "|")
+        return [file.path, String(values?.fileSize ?? 0), String(describing: values?.contentModificationDate ?? .distantPast), settings.ollamaModel, promptVersion, String(settings.qualityFirst)].joined(separator: "|")
     }
 }
 
@@ -1015,13 +1099,13 @@ enum LocalAIError: LocalizedError {
         case .runtimeMissing:
             "The embedded Ollama executable is missing from this app."
         case .bundledModelMissing:
-            "The bundled qwen3-vl:4b-instruct model is missing from this app."
+            "No bundled instruct VL model found (expected qwen3-vl:8b-instruct or qwen3-vl:4b-instruct)."
         case .runtimeStartFailed(let detail):
             "The bundled AI runtime could not start: \(detail)"
         case .runtimeExited:
             "The bundled AI runtime exited during startup."
         case .runtimeTimedOut:
-            "The bundled AI runtime did not become ready within 20 seconds."
+            "The bundled AI runtime did not become ready in time (large models need longer on first start)."
         }
     }
 }
@@ -1090,7 +1174,7 @@ final class RenderStatusStore: @unchecked Sendable {
 
     private func fingerprint(file: URL, settings: RenderSettings) -> String {
         let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        return [String(values?.fileSize ?? 0), String(describing: values?.contentModificationDate ?? .distantPast), settings.text, settings.fontName, settings.corner.rawValue, settings.direction.rawValue, String(settings.opacity), String(settings.heightPercent), String(settings.bottomOffsetPercent), String(settings.jpegQuality), settings.outputFormat.rawValue, String(settings.autoEnhance), String(settings.aiSubjectEnhance), settings.analysisMode.rawValue, settings.ollamaModel].joined(separator: "|")
+        return [String(values?.fileSize ?? 0), String(describing: values?.contentModificationDate ?? .distantPast), settings.text, settings.fontName, settings.corner.rawValue, settings.direction.rawValue, String(settings.opacity), String(settings.heightPercent), String(settings.bottomOffsetPercent), String(settings.jpegQuality), settings.outputFormat.rawValue, String(settings.autoEnhance), String(settings.aiSubjectEnhance), String(settings.qualityFirst), settings.analysisMode.rawValue, settings.ollamaModel, "enhancer-v3-quality"].joined(separator: "|")
     }
 }
 
@@ -1119,6 +1203,13 @@ final class AnalysisCache {
 }
 
 enum MeasurementEnhancer {
+    /// Stronger but still bounded caps for batch auto-enhance on Mac (local only).
+    private static let maxExposureStops = 0.72
+    private static let maxShadowLift = 0.48
+    private static let maxContrast = 0.14
+    private static let maxVibrance = 0.22
+    private static let maxSharpen = 0.45
+
     static func measure(_ image: CGImage) -> ImageMetrics {
         guard let providerData = image.dataProvider?.data,
               let bytes = CFDataGetBytePtr(providerData) else {
@@ -1160,17 +1251,119 @@ enum MeasurementEnhancer {
         )
     }
 
-    static func plan(metrics: ImageMetrics, analysis: SceneAnalysis?) -> EnhancementPlan {
+    /// Measurement-first plan. AI treatments *bias* strength instead of hard-gating to zero.
+    static func plan(metrics: ImageMetrics, analysis: SceneAnalysis?, iso: Double? = nil, qualityFirst: Bool = false) -> EnhancementPlan {
         let treatment = analysis?.recommendedTreatment
         let preserveColor = analysis?.preserveColoredLighting == true || treatment == .preserveStageLighting
         let protectHighlights = metrics.highlightHeadroom < 0.04 || analysis?.highlightsNeedProtection == true
-        let globallyDark = metrics.luminanceP50 < 0.22 && metrics.luminanceP99 < 0.92
-        let requestedGlobal = treatment == .globalExposure || (analysis == nil && globallyDark)
-        let exposure = requestedGlobal && !protectHighlights ? min(0.35, max(0, (0.30 - metrics.luminanceP50) * 1.3)) : 0
-        let requestedShadows = treatment == .shadowLift || treatment == .subjectLift || analysis == nil
         let noisyShadows = metrics.shadowFraction > 0.65 && metrics.luminanceP20 < 0.04
-        let shadowLift = requestedShadows && !noisyShadows ? min(0.28, max(0, (0.16 - metrics.luminanceP20) * 1.4)) : 0
-        return EnhancementPlan(exposureStops: exposure, shadowLift: shadowLift, protectHighlights: protectHighlights, preserveColor: preserveColor, review: treatment == .review || metrics.clippedChannelFraction > 0.18)
+        let isoValue = iso ?? 400
+        let highISO = isoValue >= 3200
+        let qualityBoost = qualityFirst ? 1.12 : 1.0
+
+        var exposure = protectHighlights ? 0 : max(0, (0.36 - metrics.luminanceP50) * 1.55 * qualityBoost)
+        var shadowLift = noisyShadows ? 0 : max(0, (0.20 - metrics.luminanceP20) * 1.75 * qualityBoost)
+        var contrast = max(0, (0.42 - metrics.luminanceP50) * 0.35 + (metrics.luminanceP99 - metrics.luminanceP20 < 0.55 ? 0.06 : 0))
+        var vibrance = preserveColor ? 0 : max(0, 0.08 + (0.30 - metrics.luminanceP50) * 0.25)
+        var sharpen = 0.18 + min(0.2, metrics.shadowFraction * 0.15)
+
+        if highISO {
+            // Avoid crunchy grain when lifting Z6 high-ISO shadows.
+            shadowLift *= 0.82
+            sharpen *= 0.55
+            contrast *= 0.90
+        }
+        if qualityFirst && !highISO {
+            sharpen *= 1.15
+            vibrance *= preserveColor ? 0 : 1.10
+        }
+
+        if analysis?.subjectsUnderexposed == true {
+            shadowLift *= 1.25
+            exposure *= 1.08
+        }
+
+        // Soft AI bias (never zero the whole plan on minimal / stage / review).
+        switch treatment {
+        case .minimal:
+            exposure *= 0.40
+            shadowLift *= 0.40
+            contrast *= 0.45
+            vibrance *= 0.35
+            sharpen *= 0.55
+        case .preserveStageLighting:
+            exposure *= 0.50
+            shadowLift *= 0.55
+            contrast *= 0.40
+            vibrance = 0
+            sharpen *= 0.70
+        case .review:
+            exposure *= 0.60
+            shadowLift *= 0.60
+            contrast *= 0.55
+            vibrance *= 0.50
+            sharpen *= 0.70
+        case .globalExposure:
+            exposure *= 1.20
+            shadowLift *= 0.90
+            contrast *= 1.10
+        case .shadowLift:
+            exposure *= 0.85
+            shadowLift *= 1.30
+            contrast *= 0.95
+        case .subjectLift:
+            exposure *= 0.90
+            shadowLift *= 1.20
+            contrast *= 1.05
+            sharpen *= 1.10
+        case .none:
+            break
+        }
+
+        if protectHighlights {
+            exposure = min(exposure, 0.18)
+            contrast *= 0.75
+        }
+
+        exposure = min(maxExposureStops, exposure)
+        shadowLift = min(maxShadowLift, shadowLift)
+        contrast = min(maxContrast, contrast)
+        vibrance = preserveColor ? 0 : min(maxVibrance, vibrance)
+        sharpen = min(maxSharpen, sharpen)
+
+        let highlightAmount: Double
+        if protectHighlights {
+            highlightAmount = 0.32
+        } else if shadowLift > 0.02 {
+            highlightAmount = 0.08
+        } else {
+            highlightAmount = 0
+        }
+
+        return EnhancementPlan(
+            exposureStops: exposure,
+            shadowLift: shadowLift,
+            highlightAmount: highlightAmount,
+            contrastAmount: contrast,
+            vibranceAmount: vibrance,
+            sharpenAmount: sharpen,
+            protectHighlights: protectHighlights,
+            preserveColor: preserveColor,
+            review: treatment == .review || metrics.clippedChannelFraction > 0.18
+        )
+    }
+
+    static func noiseLevel(forISO iso: Double?, qualityFirst: Bool) -> Double {
+        let value = iso ?? 400
+        let base: Double
+        switch value {
+        case 6400...: base = 0.055
+        case 3200..<6400: base = 0.042
+        case 1600..<3200: base = 0.028
+        case 800..<1600: base = 0.018
+        default: base = qualityFirst ? 0.010 : 0
+        }
+        return qualityFirst ? min(0.08, base * 1.15) : base
     }
 }
 
@@ -1181,12 +1374,44 @@ enum ImageRenderer {
             throw CocoaError(.fileReadCorruptFile)
         }
                 let sourceProperties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] ?? [:]
-        let developedImage = try preparedImage(file: file, sourceImage: sourceImage, settings: settings)
+        let iso = readISO(from: sourceProperties)
+        var developedImage = try preparedImage(file: file, sourceImage: sourceImage, settings: settings)
+        let noise = MeasurementEnhancer.noiseLevel(forISO: iso, qualityFirst: settings.qualityFirst)
+        if noise > 0.001 {
+            developedImage = try denoisedImage(developedImage, noiseLevel: noise)
+            log.add("\(file.lastPathComponent): denoise \(String(format: "%.3f", noise)) (ISO \(iso.map { String(Int($0)) } ?? "unknown"))")
+        }
         let metrics = MeasurementEnhancer.measure(developedImage)
         let analysis = LocalAIAnalyzer.analyze(image: developedImage, file: file, settings: settings, outputFolder: folder, metrics: metrics, log: log)
-        let plan = MeasurementEnhancer.plan(metrics: metrics, analysis: analysis)
-        let shouldMeasureEnhance = settings.autoEnhance && !(isRaw(file) && rawTherapeeURL() != nil)
-        let image = try measuredEnhancedImage(developedImage, plan: plan, enabled: shouldMeasureEnhance)
+        var plan = MeasurementEnhancer.plan(metrics: metrics, analysis: analysis, iso: iso, qualityFirst: settings.qualityFirst)
+        let usedRawTherapee = settings.autoEnhance && isRaw(file) && rawTherapeeURL() != nil
+        if usedRawTherapee && settings.qualityFirst {
+            // RawTherapee already developed; keep a gentler measured polish instead of skipping CI entirely.
+            plan = plan.scaled(by: 0.62)
+        }
+        log.add("\(file.lastPathComponent): plan EV \(String(format: "%.2f", plan.exposureStops)), shadows \(String(format: "%.2f", plan.shadowLift)), contrast \(String(format: "%.2f", plan.contrastAmount)), vibrance \(String(format: "%.2f", plan.vibranceAmount))\(plan.preserveColor ? ", preserveColor" : "")\(plan.review ? ", review" : "")")
+
+        let wantsGlobal = settings.autoEnhance && (!usedRawTherapee || settings.qualityFirst)
+        let wantsSubject = settings.aiSubjectEnhance
+
+        let image: CGImage
+        if wantsGlobal && wantsSubject {
+            let globallyEnhanced = try measuredEnhancedImage(developedImage, plan: plan, enabled: true)
+            let subjectBoost = plan.scaled(by: analysis?.subjectsUnderexposed == true || analysis?.recommendedTreatment == .subjectLift ? 0.45 : 0.28)
+            image = try subjectEnhancedImage(globallyEnhanced, plan: subjectBoost)
+            log.add("\(file.lastPathComponent): enhance path global+subject (qualityFirst=\(settings.qualityFirst))")
+        } else if wantsSubject {
+            image = try subjectEnhancedImage(developedImage, plan: plan)
+            log.add("\(file.lastPathComponent): enhance path subject-only measured")
+        } else if wantsGlobal {
+            image = try measuredEnhancedImage(developedImage, plan: plan, enabled: true)
+            log.add("\(file.lastPathComponent): enhance path global measured")
+        } else {
+            image = developedImage
+            if usedRawTherapee {
+                log.add("\(file.lastPathComponent): enhance path RawTherapee develop only")
+            }
+        }
         let width = CGFloat(image.width)
         let height = CGFloat(image.height)
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
@@ -1249,48 +1474,91 @@ enum ImageRenderer {
         }
     }
 
+    private static func ciContext() -> CIContext {
+        let working = CGColorSpace(name: CGColorSpace.extendedSRGB) ?? CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let output = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        return CIContext(options: [
+            .useSoftwareRenderer: false,
+            .workingColorSpace: working,
+            .outputColorSpace: output
+        ])
+    }
+
     private static func measuredEnhancedImage(_ image: CGImage, plan: EnhancementPlan, enabled: Bool) throws -> CGImage {
-        guard enabled else { return image }
+        guard enabled, plan.hasAdjustments else { return image }
         let input = CIImage(cgImage: image)
-        let context = CIContext(options: [.useSoftwareRenderer: false])
-        var output = input
-        if plan.exposureStops > 0, let exposure = CIFilter(name: "CIExposureAdjust") {
-            exposure.setValue(output, forKey: kCIInputImageKey)
-            exposure.setValue(plan.exposureStops, forKey: kCIInputEVKey)
-            output = exposure.outputImage ?? output
-        }
-        if let shadows = CIFilter(name: "CIHighlightShadowAdjust") {
-            shadows.setValue(output, forKey: kCIInputImageKey)
-            shadows.setValue(plan.shadowLift, forKey: "inputShadowAmount")
-            shadows.setValue(plan.protectHighlights ? 0.28 : 0.06, forKey: "inputHighlightAmount")
-            output = shadows.outputImage ?? output
-        }
-        guard let enhanced = context.createCGImage(output, from: output.extent) else {
+        let context = ciContext()
+        let output = applyMeasuredPlan(to: input, plan: plan)
+        guard let enhanced = context.createCGImage(output, from: input.extent, format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()) else {
             throw CocoaError(.coderInvalidValue)
         }
         return enhanced
     }
 
-    private static func autoAdjustedImage(_ input: CIImage) -> CIImage {
+    private static func applyMeasuredPlan(to input: CIImage, plan: EnhancementPlan) -> CIImage {
         var output = input
-        for filter in input.autoAdjustmentFilters(options: nil) {
-            filter.setValue(output, forKey: kCIInputImageKey)
-            if let filtered = filter.outputImage {
-                output = filtered
-            }
+        if plan.exposureStops > 0.001, let exposure = CIFilter(name: "CIExposureAdjust") {
+            exposure.setValue(output, forKey: kCIInputImageKey)
+            exposure.setValue(plan.exposureStops, forKey: kCIInputEVKey)
+            output = exposure.outputImage ?? output
+        }
+        if plan.shadowLift > 0.001 || plan.highlightAmount > 0.001, let shadows = CIFilter(name: "CIHighlightShadowAdjust") {
+            shadows.setValue(output, forKey: kCIInputImageKey)
+            shadows.setValue(plan.shadowLift, forKey: "inputShadowAmount")
+            shadows.setValue(plan.highlightAmount, forKey: "inputHighlightAmount")
+            output = shadows.outputImage ?? output
+        }
+        if plan.contrastAmount > 0.001 || (!plan.preserveColor && plan.vibranceAmount > 0.001), let color = CIFilter(name: "CIColorControls") {
+            color.setValue(output, forKey: kCIInputImageKey)
+            color.setValue(1.0 + plan.contrastAmount, forKey: kCIInputContrastKey)
+            color.setValue(1.0, forKey: kCIInputSaturationKey)
+            color.setValue(0.0, forKey: kCIInputBrightnessKey)
+            output = color.outputImage ?? output
+        }
+        if !plan.preserveColor, plan.vibranceAmount > 0.001, let vibrance = CIFilter(name: "CIVibrance") {
+            vibrance.setValue(output, forKey: kCIInputImageKey)
+            vibrance.setValue(plan.vibranceAmount, forKey: "inputAmount")
+            output = vibrance.outputImage ?? output
+        }
+        if plan.sharpenAmount > 0.001, let sharpen = CIFilter(name: "CISharpenLuminance") {
+            sharpen.setValue(output, forKey: kCIInputImageKey)
+            sharpen.setValue(plan.sharpenAmount, forKey: kCIInputSharpnessKey)
+            output = sharpen.outputImage ?? output
         }
         return output
     }
 
+    private static func denoisedImage(_ image: CGImage, noiseLevel: Double) throws -> CGImage {
+        guard noiseLevel > 0.001, let filter = CIFilter(name: "CINoiseReduction") else { return image }
+        let input = CIImage(cgImage: image)
+        filter.setValue(input, forKey: kCIInputImageKey)
+        filter.setValue(noiseLevel, forKey: "inputNoiseLevel")
+        filter.setValue(max(0.2, 0.55 - noiseLevel * 3), forKey: "inputSharpness")
+        let context = ciContext()
+        guard let output = filter.outputImage,
+              let result = context.createCGImage(output, from: input.extent, format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()) else {
+            return image
+        }
+        return result
+    }
+
+    private static func readISO(from properties: [CFString: Any]) -> Double? {
+        guard let exif = properties[kCGImagePropertyExifDictionary] as? [CFString: Any] else { return nil }
+        if let ratings = exif[kCGImagePropertyExifISOSpeedRatings] as? [NSNumber], let first = ratings.first {
+            return first.doubleValue
+        }
+        if let ratings = exif[kCGImagePropertyExifISOSpeedRatings] as? [Int], let first = ratings.first {
+            return Double(first)
+        }
+        return nil
+    }
+
     private static func preparedImage(file: URL, sourceImage: CGImage, settings: RenderSettings) throws -> CGImage {
-        var image = sourceImage
+        // Develop RAW only here. Measured / subject enhance runs after metrics + AI analysis.
         if settings.autoEnhance && isRaw(file), let rawTherapee = rawTherapeeURL() {
-            image = try rawTherapeeImage(file: file, sourceImage: sourceImage, executable: rawTherapee)
+            return try rawTherapeeImage(file: file, sourceImage: sourceImage, executable: rawTherapee)
         }
-        if settings.aiSubjectEnhance {
-            image = try subjectEnhancedImage(image)
-        }
-        return image
+        return sourceImage
     }
 
     private static func rawTherapeeImage(file: URL, sourceImage: CGImage, executable: URL) throws -> CGImage {
@@ -1317,21 +1585,33 @@ enum ImageRenderer {
         return renderedImage
     }
 
-    private static func subjectEnhancedImage(_ image: CGImage) throws -> CGImage {
+    private static func subjectEnhancedImage(_ image: CGImage, plan: EnhancementPlan) throws -> CGImage {
+        guard plan.hasAdjustments else { return image }
         let handler = VNImageRequestHandler(cgImage: image)
         let request = VNGenerateForegroundInstanceMaskRequest()
         try handler.perform([request])
         guard let observation = request.results?.first else { return image }
         let maskBuffer = try observation.generateScaledMaskForImage(forInstances: observation.allInstances, from: handler)
         let original = CIImage(cgImage: image)
-        let adjusted = autoAdjustedImage(original)
+        let adjusted = applyMeasuredPlan(to: original, plan: plan)
+        let rawMask = CIImage(cvPixelBuffer: maskBuffer)
+        let featherRadius = max(2.5, min(18.0, Double(max(image.width, image.height)) * 0.004))
+        let featheredMask: CIImage
+        if let blur = CIFilter(name: "CIGaussianBlur") {
+            blur.setValue(rawMask, forKey: kCIInputImageKey)
+            blur.setValue(featherRadius, forKey: kCIInputRadiusKey)
+            let blurred = blur.outputImage ?? rawMask
+            featheredMask = blurred.cropped(to: original.extent)
+        } else {
+            featheredMask = rawMask
+        }
         guard let blend = CIFilter(name: "CIBlendWithMask") else { return image }
         blend.setValue(adjusted, forKey: kCIInputImageKey)
         blend.setValue(original, forKey: kCIInputBackgroundImageKey)
-        blend.setValue(CIImage(cvPixelBuffer: maskBuffer), forKey: kCIInputMaskImageKey)
-        let context = CIContext(options: [.useSoftwareRenderer: false])
+        blend.setValue(featheredMask, forKey: kCIInputMaskImageKey)
+        let context = ciContext()
         guard let output = blend.outputImage,
-              let result = context.createCGImage(output, from: original.extent) else {
+              let result = context.createCGImage(output, from: original.extent, format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()) else {
             return image
         }
         return result
