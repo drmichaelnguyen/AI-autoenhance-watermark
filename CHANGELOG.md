@@ -2,9 +2,20 @@
 
 All notable versions of **AI-autoenhance-watermark** (Watermark Tool).
 
+## Unreleased — enhancer-v3-skin-safe
+
+**Status:** quality-first retained, with portrait/skin protections after people photos looked worse than the `v2026.09.07` baseline.
+
+### Changes
+
+- **Skin-safe path:** Vision face detect + `portrait`/`event` AI scenes soften exposure/shadows, cut vibrance/sharpen/contrast, and skip stacking vibrance/sharpen on the subject second pass
+- **Denoise:** no longer applied on clean low-ISO frames; further reduced when faces are present (avoids waxy skin)
+- **Milder quality-first boosts** overall; people plans use tighter caps than landscape/stage
+- Resume fingerprint `enhancer-v3-skin-safe` so prior quality-first outputs re-run
+
 ## Unreleased — enhancer-v3 quality-first (M1 32GB personal)
 
-**Status:** source updated for quality-over-speed personal Nikon Z6 use.
+**Status:** source updated for quality-over-speed personal Nikon Z6 use; skin-safe refinements above.
 
 ### Changes
 

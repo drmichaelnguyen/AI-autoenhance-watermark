@@ -1,19 +1,19 @@
 # Watermark Tool
 
-**Version:** `enhancer-v3` quality-first (unreleased; builds on `2026.09.07`)  
+**Version:** `enhancer-v3-skin-safe` (unreleased; builds on `2026.09.07`)  
 **Repo:** [drmichaelnguyen/AI-autoenhance-watermark](https://github.com/drmichaelnguyen/AI-autoenhance-watermark)
 
 Native macOS batch **AI auto-enhance + watermark** for personal Nikon Z6 / NEF work. Built with SwiftUI, Core Image, Vision, and ImageIO. All AI runs locally. **Quality over speed** is the default: batches may take hours; the app and embedded Ollama run at background/utility priority so other Mac work stays usable.
 
-See [CHANGELOG.md](CHANGELOG.md) for enhancer-v3 details.
+See [CHANGELOG.md](CHANGELOG.md) for enhancer-v3 / skin-safe details.
 
 ## Processing pipeline
 
-The app keeps source RAW files untouched. RAW files use RawTherapee's CLI when **Auto-enhance image** is enabled and the executable is installed; otherwise ImageIO supplies the source image. Non-RAW auto-enhancement uses a **stronger but still bounded** measured Core Image plan (exposure, shadows/highlights, contrast, vibrance, sharpening)—not uncontrolled `autoAdjustmentFilters`.
+The app keeps source RAW files untouched. RAW files use RawTherapee's CLI when **Auto-enhance image** is enabled and the executable is installed; otherwise ImageIO supplies the source image. Non-RAW auto-enhancement uses a **bounded** measured Core Image plan (exposure, shadows/highlights, contrast, vibrance, sharpening)—not uncontrolled `autoAdjustmentFilters`.
 
-The processing order is: develop or decode -> measure -> optional local AI scene analysis (soft bias) -> bounded enhancement (global and/or feathered subject) -> watermark -> one output encode. Measurement reads display-referred RGB samples after decode; intermediate CI work uses extended sRGB; the final watermark context is sRGB device RGB.
+The processing order is: develop or decode -> optional ISO denoise -> measure -> optional local AI scene analysis (soft bias) -> bounded enhancement (global and/or feathered subject) -> watermark -> one output encode. Measurement reads display-referred RGB samples after decode; intermediate CI work uses extended sRGB; the final watermark context is sRGB device RGB.
 
-Measurements include luminance 20th, 50th, and 99th percentiles, shadow density, highlight headroom, and per-channel clipping. Exposure is capped near 0.72 stops and shadow lifting near 0.48. Deep noisy shadows suppress lifting. AI analysis **biases** the plan instead of hard-zeroing treatments like `minimal` or `preserve_stage_lighting`. `preserveColor` skips vibrance so stage/colored lighting is kept. The Vision subject toggle applies the **same measured plan** to a feathered foreground mask only; combined with global auto-enhance it does not stack opaque Apple auto-adjust filters.
+Measurements include luminance 20th, 50th, and 99th percentiles, shadow density, highlight headroom, and per-channel clipping. Exposure is capped near 0.72 stops and shadow lifting near 0.48 (tighter when faces/`portrait`/`event` are detected). Deep noisy shadows suppress lifting. AI analysis **biases** the plan instead of hard-zeroing treatments like `minimal` or `preserve_stage_lighting`. `preserveColor` skips vibrance so stage/colored lighting is kept. People photos use a **skin-safe** path: much less vibrance/sharpen, reduced denoise, and a subject second pass that lifts tone only (no stacked color/sharpen on skin).
 
 ## Bundled local AI analysis
 
@@ -25,7 +25,7 @@ The **Test local AI** button verifies that the embedded runtime starts and the b
 
 ## Batch safety
 
-The app processes one image at a time, keeps the AI request serialized, releases each image after export, and reports progress. Cancel stops between images. `.watermark-status.json` fingerprints include `enhancer-v3-quality`. JPEG default quality is 0.95. ISO-aware denoise runs before tone when Quality first is on.
+The app processes one image at a time, keeps the AI request serialized, releases each image after export, and reports progress. Cancel stops between images. `.watermark-status.json` fingerprints include `enhancer-v3-skin-safe`. JPEG default quality is 0.95. ISO-aware denoise runs before tone for higher ISO; it is skipped on clean low-ISO frames and further reduced when faces are present.
 
 ## Run (on Mac)
 

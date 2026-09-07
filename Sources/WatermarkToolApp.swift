@@ -688,6 +688,21 @@ struct EnhancementPlan: Sendable {
         )
     }
 
+    /// Second-pass subject boost for people: lift tone only — no extra vibrance/sharpen on skin.
+    func skinSafeSubjectBoost(factor: Double) -> EnhancementPlan {
+        EnhancementPlan(
+            exposureStops: exposureStops * factor,
+            shadowLift: shadowLift * factor,
+            highlightAmount: highlightAmount * factor,
+            contrastAmount: contrastAmount * factor * 0.35,
+            vibranceAmount: 0,
+            sharpenAmount: 0,
+            protectHighlights: protectHighlights,
+            preserveColor: true,
+            review: review
+        )
+    }
+
     var hasAdjustments: Bool {
         exposureStops > 0.001 || shadowLift > 0.001 || highlightAmount > 0.001
             || contrastAmount > 0.001 || vibranceAmount > 0.001 || sharpenAmount > 0.001
@@ -1174,7 +1189,7 @@ final class RenderStatusStore: @unchecked Sendable {
 
     private func fingerprint(file: URL, settings: RenderSettings) -> String {
         let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        return [String(values?.fileSize ?? 0), String(describing: values?.contentModificationDate ?? .distantPast), settings.text, settings.fontName, settings.corner.rawValue, settings.direction.rawValue, String(settings.opacity), String(settings.heightPercent), String(settings.bottomOffsetPercent), String(settings.jpegQuality), settings.outputFormat.rawValue, String(settings.autoEnhance), String(settings.aiSubjectEnhance), String(settings.qualityFirst), settings.analysisMode.rawValue, settings.ollamaModel, "enhancer-v3-quality"].joined(separator: "|")
+        return [String(values?.fileSize ?? 0), String(describing: values?.contentModificationDate ?? .distantPast), settings.text, settings.fontName, settings.corner.rawValue, settings.direction.rawValue, String(settings.opacity), String(settings.heightPercent), String(settings.bottomOffsetPercent), String(settings.jpegQuality), settings.outputFormat.rawValue, String(settings.autoEnhance), String(settings.aiSubjectEnhance), String(settings.qualityFirst), settings.analysisMode.rawValue, settings.ollamaModel, "enhancer-v3-skin-safe"].joined(separator: "|")
     }
 }
 
@@ -1252,14 +1267,17 @@ enum MeasurementEnhancer {
     }
 
     /// Measurement-first plan. AI treatments *bias* strength instead of hard-gating to zero.
-    static func plan(metrics: ImageMetrics, analysis: SceneAnalysis?, iso: Double? = nil, qualityFirst: Bool = false) -> EnhancementPlan {
+    static func plan(metrics: ImageMetrics, analysis: SceneAnalysis?, iso: Double? = nil, qualityFirst: Bool = false, protectSkin: Bool = false) -> EnhancementPlan {
         let treatment = analysis?.recommendedTreatment
+        let peopleScene = analysis?.sceneCategory == .portrait || analysis?.sceneCategory == .event
+        let skinSafe = protectSkin || peopleScene
         let preserveColor = analysis?.preserveColoredLighting == true || treatment == .preserveStageLighting
         let protectHighlights = metrics.highlightHeadroom < 0.04 || analysis?.highlightsNeedProtection == true
         let noisyShadows = metrics.shadowFraction > 0.65 && metrics.luminanceP20 < 0.04
         let isoValue = iso ?? 400
         let highISO = isoValue >= 3200
-        let qualityBoost = qualityFirst ? 1.12 : 1.0
+        // Keep quality-first modest; prior 1.12 boost + vibrance/sharpen stacked plastic skin.
+        let qualityBoost = qualityFirst ? (skinSafe ? 1.04 : 1.08) : 1.0
 
         var exposure = protectHighlights ? 0 : max(0, (0.36 - metrics.luminanceP50) * 1.55 * qualityBoost)
         var shadowLift = noisyShadows ? 0 : max(0, (0.20 - metrics.luminanceP20) * 1.75 * qualityBoost)
@@ -1273,14 +1291,23 @@ enum MeasurementEnhancer {
             sharpen *= 0.55
             contrast *= 0.90
         }
-        if qualityFirst && !highISO {
-            sharpen *= 1.15
-            vibrance *= preserveColor ? 0 : 1.10
+        if qualityFirst && !highISO && !skinSafe {
+            sharpen *= 1.08
+            vibrance *= preserveColor ? 0 : 1.05
+        }
+
+        if skinSafe {
+            // People: prefer gentle tone; avoid orange/crunchy skin from vibrance + luminance sharpen.
+            exposure *= 0.90
+            shadowLift *= 0.92
+            contrast *= 0.55
+            vibrance = min(vibrance * 0.20, 0.04)
+            sharpen *= 0.40
         }
 
         if analysis?.subjectsUnderexposed == true {
-            shadowLift *= 1.25
-            exposure *= 1.08
+            shadowLift *= skinSafe ? 1.12 : 1.25
+            exposure *= skinSafe ? 1.04 : 1.08
         }
 
         // Soft AI bias (never zero the whole plan on minimal / stage / review).
@@ -1304,18 +1331,18 @@ enum MeasurementEnhancer {
             vibrance *= 0.50
             sharpen *= 0.70
         case .globalExposure:
-            exposure *= 1.20
+            exposure *= skinSafe ? 1.08 : 1.20
             shadowLift *= 0.90
-            contrast *= 1.10
+            contrast *= skinSafe ? 0.95 : 1.10
         case .shadowLift:
             exposure *= 0.85
-            shadowLift *= 1.30
+            shadowLift *= skinSafe ? 1.15 : 1.30
             contrast *= 0.95
         case .subjectLift:
             exposure *= 0.90
-            shadowLift *= 1.20
-            contrast *= 1.05
-            sharpen *= 1.10
+            shadowLift *= skinSafe ? 1.12 : 1.20
+            contrast *= skinSafe ? 0.95 : 1.05
+            sharpen *= skinSafe ? 0.85 : 1.10
         case .none:
             break
         }
@@ -1325,17 +1352,19 @@ enum MeasurementEnhancer {
             contrast *= 0.75
         }
 
-        exposure = min(maxExposureStops, exposure)
-        shadowLift = min(maxShadowLift, shadowLift)
-        contrast = min(maxContrast, contrast)
-        vibrance = preserveColor ? 0 : min(maxVibrance, vibrance)
-        sharpen = min(maxSharpen, sharpen)
+        let vibranceCap = skinSafe ? 0.06 : maxVibrance
+        let sharpenCap = skinSafe ? 0.18 : maxSharpen
+        exposure = min(skinSafe ? 0.48 : maxExposureStops, exposure)
+        shadowLift = min(skinSafe ? 0.36 : maxShadowLift, shadowLift)
+        contrast = min(skinSafe ? 0.08 : maxContrast, contrast)
+        vibrance = preserveColor ? 0 : min(vibranceCap, vibrance)
+        sharpen = min(sharpenCap, sharpen)
 
         let highlightAmount: Double
         if protectHighlights {
             highlightAmount = 0.32
         } else if shadowLift > 0.02 {
-            highlightAmount = 0.08
+            highlightAmount = skinSafe ? 0.05 : 0.08
         } else {
             highlightAmount = 0
         }
@@ -1353,7 +1382,7 @@ enum MeasurementEnhancer {
         )
     }
 
-    static func noiseLevel(forISO iso: Double?, qualityFirst: Bool) -> Double {
+    static func noiseLevel(forISO iso: Double?, qualityFirst: Bool, protectSkin: Bool = false) -> Double {
         let value = iso ?? 400
         let base: Double
         switch value {
@@ -1361,9 +1390,14 @@ enum MeasurementEnhancer {
         case 3200..<6400: base = 0.042
         case 1600..<3200: base = 0.028
         case 800..<1600: base = 0.018
-        default: base = qualityFirst ? 0.010 : 0
+        // Do not denoise clean low-ISO frames — it waxes skin texture.
+        default: base = 0
         }
-        return qualityFirst ? min(0.08, base * 1.15) : base
+        var level = qualityFirst ? min(0.08, base * 1.10) : base
+        if protectSkin {
+            level *= 0.30
+        }
+        return level
     }
 }
 
@@ -1376,20 +1410,23 @@ enum ImageRenderer {
                 let sourceProperties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] ?? [:]
         let iso = readISO(from: sourceProperties)
         var developedImage = try preparedImage(file: file, sourceImage: sourceImage, settings: settings)
-        let noise = MeasurementEnhancer.noiseLevel(forISO: iso, qualityFirst: settings.qualityFirst)
+        let hasFaces = imageContainsFaces(developedImage)
+        let noise = MeasurementEnhancer.noiseLevel(forISO: iso, qualityFirst: settings.qualityFirst, protectSkin: hasFaces)
         if noise > 0.001 {
             developedImage = try denoisedImage(developedImage, noiseLevel: noise)
-            log.add("\(file.lastPathComponent): denoise \(String(format: "%.3f", noise)) (ISO \(iso.map { String(Int($0)) } ?? "unknown"))")
+            log.add("\(file.lastPathComponent): denoise \(String(format: "%.3f", noise)) (ISO \(iso.map { String(Int($0)) } ?? "unknown")\(hasFaces ? ", skin-safe" : ""))")
         }
         let metrics = MeasurementEnhancer.measure(developedImage)
         let analysis = LocalAIAnalyzer.analyze(image: developedImage, file: file, settings: settings, outputFolder: folder, metrics: metrics, log: log)
-        var plan = MeasurementEnhancer.plan(metrics: metrics, analysis: analysis, iso: iso, qualityFirst: settings.qualityFirst)
+        let peopleScene = analysis?.sceneCategory == .portrait || analysis?.sceneCategory == .event
+        let protectSkin = hasFaces || peopleScene
+        var plan = MeasurementEnhancer.plan(metrics: metrics, analysis: analysis, iso: iso, qualityFirst: settings.qualityFirst, protectSkin: protectSkin)
         let usedRawTherapee = settings.autoEnhance && isRaw(file) && rawTherapeeURL() != nil
         if usedRawTherapee && settings.qualityFirst {
             // RawTherapee already developed; keep a gentler measured polish instead of skipping CI entirely.
-            plan = plan.scaled(by: 0.62)
+            plan = plan.scaled(by: protectSkin ? 0.45 : 0.62)
         }
-        log.add("\(file.lastPathComponent): plan EV \(String(format: "%.2f", plan.exposureStops)), shadows \(String(format: "%.2f", plan.shadowLift)), contrast \(String(format: "%.2f", plan.contrastAmount)), vibrance \(String(format: "%.2f", plan.vibranceAmount))\(plan.preserveColor ? ", preserveColor" : "")\(plan.review ? ", review" : "")")
+        log.add("\(file.lastPathComponent): plan EV \(String(format: "%.2f", plan.exposureStops)), shadows \(String(format: "%.2f", plan.shadowLift)), contrast \(String(format: "%.2f", plan.contrastAmount)), vibrance \(String(format: "%.2f", plan.vibranceAmount))\(protectSkin ? ", skin-safe" : "")\(plan.preserveColor ? ", preserveColor" : "")\(plan.review ? ", review" : "")")
 
         let wantsGlobal = settings.autoEnhance && (!usedRawTherapee || settings.qualityFirst)
         let wantsSubject = settings.aiSubjectEnhance
@@ -1397,12 +1434,14 @@ enum ImageRenderer {
         let image: CGImage
         if wantsGlobal && wantsSubject {
             let globallyEnhanced = try measuredEnhancedImage(developedImage, plan: plan, enabled: true)
-            let subjectBoost = plan.scaled(by: analysis?.subjectsUnderexposed == true || analysis?.recommendedTreatment == .subjectLift ? 0.45 : 0.28)
+            let boostFactor = analysis?.subjectsUnderexposed == true || analysis?.recommendedTreatment == .subjectLift ? 0.45 : 0.28
+            let subjectBoost = protectSkin ? plan.skinSafeSubjectBoost(factor: boostFactor) : plan.scaled(by: boostFactor)
             image = try subjectEnhancedImage(globallyEnhanced, plan: subjectBoost)
-            log.add("\(file.lastPathComponent): enhance path global+subject (qualityFirst=\(settings.qualityFirst))")
+            log.add("\(file.lastPathComponent): enhance path global+subject (qualityFirst=\(settings.qualityFirst)\(protectSkin ? ", skin-safe subject" : ""))")
         } else if wantsSubject {
-            image = try subjectEnhancedImage(developedImage, plan: plan)
-            log.add("\(file.lastPathComponent): enhance path subject-only measured")
+            let subjectPlan = protectSkin ? plan.skinSafeSubjectBoost(factor: 1.0) : plan
+            image = try subjectEnhancedImage(developedImage, plan: subjectPlan)
+            log.add("\(file.lastPathComponent): enhance path subject-only measured\(protectSkin ? " (skin-safe)" : "")")
         } else if wantsGlobal {
             image = try measuredEnhancedImage(developedImage, plan: plan, enabled: true)
             log.add("\(file.lastPathComponent): enhance path global measured")
@@ -1583,6 +1622,17 @@ enum ImageRenderer {
             return sourceImage
         }
         return renderedImage
+    }
+
+    private static func imageContainsFaces(_ image: CGImage) -> Bool {
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        let request = VNDetectFaceRectanglesRequest()
+        do {
+            try handler.perform([request])
+            return !(request.results ?? []).isEmpty
+        } catch {
+            return false
+        }
     }
 
     private static func subjectEnhancedImage(_ image: CGImage, plan: EnhancementPlan) throws -> CGImage {
