@@ -1,0 +1,1363 @@
+import SwiftUI
+import AppKit
+import CoreImage
+import ImageIO
+import UniformTypeIdentifiers
+import Vision
+import Foundation
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationWillTerminate(_ notification: Notification) {
+        EmbeddedOllamaManager.shared.stop()
+    }
+}
+
+@main
+struct WatermarkToolApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        WindowGroup("Watermark Tool") {
+            ContentView()
+                .frame(minWidth: 760, minHeight: 610)
+        }
+        .windowResizability(.contentSize)
+    }
+}
+
+struct ContentView: View {
+    @State private var model = WatermarkModel()
+    @State private var isTargeted = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            HStack(spacing: 0) {
+                settings
+                    .frame(width: 300)
+                Divider()
+                preview
+            }
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
+            model.acceptDrop(providers)
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Watermark Tool")
+                    .font(.system(size: 24, weight: .semibold, design: .rounded))
+                Text("Batch mark images while keeping originals untouched")
+                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+            }
+            Spacer()
+            if model.isProcessing {
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(spacing: 8) {
+                        ProgressView(value: model.progress)
+                            .frame(width: 150)
+                        Text("\(model.completedCount) of \(model.totalCount)")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("Processing…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Button("Cancel") { model.cancel() }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(24)
+    }
+
+    private var settings: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                folderSection
+                Divider()
+                watermarkSection
+                Divider()
+                appearanceSection
+                Divider()
+                analysisSection
+                Button {
+                    model.process()
+                } label: {
+                    Label("Watermark Images", systemImage: "wand.and.stars")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!model.canProcess)
+            }
+            .padding(22)
+        }
+    }
+
+    private var folderSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("Folders", systemImage: "folder")
+            Button {
+                model.chooseInputFolder()
+            } label: {
+                Label(model.inputFolderName ?? "Choose input folder", systemImage: "arrow.down.doc")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+
+            Button {
+                model.chooseOutputFolder()
+            } label: {
+                Label(model.outputFolderName ?? "Choose output folder", systemImage: "arrow.up.doc")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+
+            if let count = model.imageCount {
+                Text("\(count) supported image\(count == 1 ? "" : "s") found")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var watermarkSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("Watermark", systemImage: "textformat")
+            TextField("Text to add", text: $model.text)
+                .textFieldStyle(.roundedBorder)
+            Picker("Font", selection: $model.fontName) {
+                ForEach(model.availableFonts, id: \.self) { font in
+                    Text(font)
+                        .font(.custom(font, size: 15))
+                        .tag(font)
+                }
+            }
+            Picker("Corner", selection: $model.corner) {
+                ForEach(WatermarkCorner.allCases) { corner in
+                    Text(corner.label).tag(corner)
+                }
+            }
+            Picker("Direction", selection: $model.direction) {
+                ForEach(WatermarkDirection.allCases) { direction in
+                    Text(direction.label).tag(direction)
+                }
+            }
+        }
+    }
+
+    private var appearanceSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("Appearance", systemImage: "slider.horizontal.3")
+            LabeledContent("Opacity") {
+                HStack(spacing: 8) {
+                    Slider(value: $model.opacity, in: 0.05...1)
+                    Text("\(Int(model.opacity * 100))%")
+                        .monospacedDigit()
+                        .frame(width: 38, alignment: .trailing)
+                }
+            }
+            LabeledContent("Height") {
+                HStack(spacing: 8) {
+                    Slider(value: $model.heightPercent, in: 1...30)
+                    Text("\(Int(model.heightPercent))%")
+                        .monospacedDigit()
+                        .frame(width: 38, alignment: .trailing)
+                }
+            }
+            Text("Watermark size as a percentage of each image’s original height.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            LabeledContent("Bottom offset") {
+                HStack(spacing: 8) {
+                    Slider(value: $model.bottomOffsetPercent, in: 0...50)
+                    Text("\(Int(model.bottomOffsetPercent))%")
+                        .monospacedDigit()
+                        .frame(width: 38, alignment: .trailing)
+                }
+            }
+            Text("Height above the bottom edge. Used for either bottom corner.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Toggle("Auto-enhance image", isOn: $model.autoEnhance)
+            Text("Balances exposure, contrast, color, and sharpness before adding the watermark.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Toggle("AI subject enhancement", isOn: $model.aiSubjectEnhance)
+            Text("Detects the foreground subject and enhances it without changing the background.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            LabeledContent("JPEG quality") {
+                HStack(spacing: 8) {
+                    Slider(value: $model.jpegQuality, in: 0.5...1)
+                    Text("\(Int(model.jpegQuality * 100))%")
+                        .monospacedDigit()
+                        .frame(width: 38, alignment: .trailing)
+                }
+            }
+            Picker("Output", selection: $model.outputFormat) {
+                ForEach(OutputFormat.allCases) { format in
+                    Text(format.label).tag(format)
+                }
+            }
+            if model.outputFormat == .original, model.containsRawInput {
+                Text("Original format is not available for RAW files. Choose Compressed JPEG for NEF output.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private var analysisSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            sectionTitle("Local analysis", systemImage: "cpu")
+            Picker("AI analysis", selection: $model.analysisMode) {
+                ForEach(AnalysisMode.allCases) { mode in
+                    Text(mode.label).tag(mode)
+                }
+            }
+            Text("Uses Ollama only for scene classification. Pixel adjustments remain bounded and measurement-driven.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if model.analysisMode != .off {
+                LabeledContent("Bundled model") {
+                    Text(model.ollamaModel)
+                        .foregroundStyle(.secondary)
+                }
+                Text("Runs entirely inside this app. Invalid output automatically falls back to measured adjustments.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    Button("Test local AI") { model.testLocalAI() }
+                        .disabled(model.isTestingAI)
+                    if model.isTestingAI {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                }
+                if let status = model.aiStatus {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(model.aiIsAvailable ? .green : .orange)
+                }
+            }
+            Divider()
+            sectionTitle("Work log", systemImage: "list.bullet.rectangle")
+            if model.logEntries.isEmpty {
+                Text("Processing and AI decisions will appear here.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    Text(model.logEntries.joined(separator: "\n"))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(height: 130)
+            }
+            if let logURL = model.logURL {
+                Button("Show log in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([logURL])
+                }
+                .buttonStyle(.link)
+            }
+        }
+    }
+
+    private var preview: some View {
+        VStack(spacing: 18) {
+            if let image = model.previewImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(30)
+                    .overlay(alignment: model.corner.alignment) {
+                        if !model.text.isEmpty {
+                            Text(model.text)
+                                .font(.custom(model.fontName, size: model.previewFontSize))
+                                .foregroundStyle(.white.opacity(model.opacity))
+                                .shadow(color: .black.opacity(model.opacity * 0.65), radius: 0, x: 0, y: 0)
+                                .rotationEffect(.radians(model.direction.angle))
+                                .padding(30)
+                                .offset(y: model.previewVerticalOffset)
+                        }
+                    }
+            } else {
+                Image(systemName: isTargeted ? "arrow.down.circle.fill" : "photo.on.rectangle.angled")
+                    .font(.system(size: 52, weight: .light))
+                    .foregroundStyle(isTargeted ? Color.accentColor : .secondary)
+                Text(isTargeted ? "Drop a folder or image here" : "Choose an input folder to preview its first image")
+                    .foregroundStyle(.secondary)
+            }
+            if let message = model.message {
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(model.didSucceed ? .green : .secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 28)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.opacity(0.04))
+    }
+
+    private func sectionTitle(_ title: String, systemImage: String) -> some View {
+        Label(title, systemImage: systemImage)
+            .font(.headline)
+    }
+}
+
+enum WatermarkCorner: String, CaseIterable, Identifiable {
+    case topLeft, topRight, bottomLeft, bottomRight
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .topLeft: "Top left"
+        case .topRight: "Top right"
+        case .bottomLeft: "Bottom left"
+        case .bottomRight: "Bottom right"
+        }
+    }
+
+    var alignment: Alignment {
+        switch self {
+        case .topLeft: .topLeading
+        case .topRight: .topTrailing
+        case .bottomLeft: .bottomLeading
+        case .bottomRight: .bottomTrailing
+        }
+    }
+}
+
+enum WatermarkDirection: String, CaseIterable, Identifiable {
+    case normal, clockwise, upsideDown, counterclockwise
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .normal: "Normal"
+        case .clockwise: "90° clockwise"
+        case .upsideDown: "180°"
+        case .counterclockwise: "90° counterclockwise"
+        }
+    }
+
+    var angle: CGFloat {
+        switch self {
+        case .normal: 0
+        case .clockwise: -.pi / 2
+        case .upsideDown: .pi
+        case .counterclockwise: .pi / 2
+        }
+    }
+}
+
+enum OutputFormat: String, CaseIterable, Identifiable {
+    case original, jpeg
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .original: "Original format"
+        case .jpeg: "Compressed JPEG"
+        }
+    }
+}
+
+enum AnalysisMode: String, CaseIterable, Identifiable, Sendable {
+    case off, selective, all
+
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .off: "Off"
+        case .selective: "Selective (default)"
+        case .all: "All images"
+        }
+    }
+}
+
+@MainActor
+@Observable
+final class WatermarkModel {
+    var text = ""
+    var fontName = "Helvetica Neue"
+    var corner = WatermarkCorner.bottomRight
+    var direction = WatermarkDirection.normal
+    var opacity = 0.72
+    var heightPercent = 5.0
+    var bottomOffsetPercent = 2.5
+    var jpegQuality = 0.85
+    var outputFormat = OutputFormat.original
+    var autoEnhance = false
+    var aiSubjectEnhance = false
+    var analysisMode = AnalysisMode.off
+    var ollamaModel = "qwen3-vl:4b-instruct"
+    var inputFolder: URL?
+    var outputFolder: URL?
+    var previewImage: NSImage?
+    var imageCount: Int?
+    var isProcessing = false
+    var completedCount = 0
+    var totalCount = 0
+    var message: String?
+    var didSucceed = false
+    var logEntries: [String] = []
+    var logURL: URL?
+    var aiStatus: String?
+    var aiIsAvailable = false
+    var isTestingAI = false
+    private var cancellationToken: RenderCancellationToken?
+
+    var progress: Double {
+        totalCount == 0 ? 0 : Double(completedCount) / Double(totalCount)
+    }
+
+    var containsRawInput: Bool {
+        guard let inputFolder else { return false }
+        return imageFiles(in: inputFolder).contains { isRaw($0) }
+    }
+
+    var previewFontSize: CGFloat {
+        max(12, min(72, 420 * heightPercent / 100))
+    }
+
+    var previewVerticalOffset: CGFloat {
+        switch corner {
+        case .bottomLeft, .bottomRight:
+            -CGFloat(420 * bottomOffsetPercent / 100)
+        case .topLeft, .topRight:
+            0
+        }
+    }
+
+    let availableFonts = [
+        "Helvetica Neue", "Avenir Next", "Georgia", "Menlo", "Futura", "Palatino",
+        "Bradley Hand", "Chalkboard", "Marker Felt", "Noteworthy", "Apple Chancery",
+        "Snell Roundhand", "SignPainter", "Zapfino"
+    ]
+    private let supportedExtensions = Set(["jpg", "jpeg", "png", "tif", "tiff", "heic", "heif", "dng", "raw", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"])
+
+    var inputFolderName: String? { inputFolder?.lastPathComponent }
+    var outputFolderName: String? { outputFolder?.lastPathComponent }
+    var canProcess: Bool {
+        inputFolder != nil && outputFolder != nil && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isProcessing && !(outputFormat == .original && containsRawInput)
+    }
+
+    func chooseInputFolder() {
+        guard let folder = chooseFolder() else { return }
+        inputFolder = folder
+        let files = imageFiles(in: folder)
+        imageCount = files.count
+        previewImage = files.first.flatMap { NSImage(contentsOf: $0) }
+        message = nil
+    }
+
+    func chooseOutputFolder() {
+        outputFolder = chooseFolder()
+    }
+
+    func testLocalAI() {
+        isTestingAI = true
+        aiStatus = "Starting bundled local AI…"
+        LocalAIAnalyzer.testConnection(model: ollamaModel) { result in
+            DispatchQueue.main.async {
+                self.isTestingAI = false
+                switch result {
+                case .success(let message):
+                    self.aiIsAvailable = true
+                    self.aiStatus = message
+                case .failure(let error):
+                    self.aiIsAvailable = false
+                    self.aiStatus = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func acceptDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first else { return false }
+        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+            guard let data = item as? Data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+            DispatchQueue.main.async {
+                var isDirectory: ObjCBool = false
+                if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+                    self.inputFolder = url
+                    self.imageCount = self.imageFiles(in: url).count
+                    self.previewImage = self.imageFiles(in: url).first.flatMap { NSImage(contentsOf: $0) }
+                }
+            }
+        }
+        return true
+    }
+
+    func process() {
+        guard let inputFolder, let outputFolder else { return }
+        let files = imageFiles(in: inputFolder)
+        isProcessing = true
+        completedCount = 0
+        totalCount = files.count
+        message = nil
+        didSucceed = false
+        let cancellationToken = RenderCancellationToken()
+        self.cancellationToken = cancellationToken
+        let statusStore = RenderStatusStore(folder: outputFolder)
+        let workLog = WorkLog(folder: outputFolder) { entries in
+            DispatchQueue.main.async {
+                self.logEntries = entries
+            }
+        }
+        logURL = workLog.url
+        logEntries = []
+        let settings = RenderSettings(text: text, fontName: fontName, corner: corner, direction: direction, opacity: opacity, heightPercent: heightPercent, bottomOffsetPercent: bottomOffsetPercent, jpegQuality: jpegQuality, outputFormat: outputFormat, autoEnhance: autoEnhance, aiSubjectEnhance: aiSubjectEnhance, analysisMode: analysisMode, ollamaModel: ollamaModel)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var completed = 0
+            var failures = 0
+            workLog.add("Batch started: \(files.count) image(s), AI \(settings.analysisMode.label), model \(settings.ollamaModel)")
+            for file in files {
+                if cancellationToken.isCancelled { break }
+                do {
+                    if statusStore.isComplete(file: file, settings: settings) {
+                        workLog.add("\(file.lastPathComponent): skipped (already complete)")
+                        completed += 1
+                    } else {
+                        workLog.add("\(file.lastPathComponent): processing")
+                        let outputURL = try ImageRenderer.render(file: file, to: outputFolder, settings: settings, log: workLog)
+                        statusStore.markComplete(file: file, settings: settings, output: outputURL)
+                        workLog.add("\(file.lastPathComponent): saved as \(outputURL.lastPathComponent)")
+                        completed += 1
+                    }
+                } catch {
+                    workLog.add("\(file.lastPathComponent): FAILED — \(error.localizedDescription)")
+                    failures += 1
+                }
+                let processed = completed + failures
+                DispatchQueue.main.async {
+                    self.completedCount = processed
+                }
+            }
+            workLog.add(cancellationToken.isCancelled ? "Batch cancelled" : "Batch finished: \(completed) completed, \(failures) failed")
+            DispatchQueue.main.async {
+                self.isProcessing = false
+                self.cancellationToken = nil
+                self.didSucceed = failures == 0 && !cancellationToken.isCancelled
+                self.message = cancellationToken.isCancelled ? "Cancelled after \(completed) image\(completed == 1 ? "" : "s"). Resume is available." : failures == 0 ? "Created \(completed) watermarked image\(completed == 1 ? "" : "s") in the output folder." : "Created \(completed) image\(completed == 1 ? "" : "s"); \(failures) could not be processed."
+            }
+        }
+    }
+
+    func cancel() {
+        cancellationToken?.cancel()
+    }
+
+    private func chooseFolder() -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    private func imageFiles(in folder: URL) -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil))?.filter {
+            supportedExtensions.contains($0.pathExtension.lowercased())
+        }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending } ?? []
+    }
+
+    private func isRaw(_ file: URL) -> Bool {
+        ["dng", "raw", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"].contains(file.pathExtension.lowercased())
+    }
+}
+
+struct RenderSettings: Sendable {
+    let text: String
+    let fontName: String
+    let corner: WatermarkCorner
+    let direction: WatermarkDirection
+    let opacity: Double
+    let heightPercent: Double
+    let bottomOffsetPercent: Double
+    let jpegQuality: Double
+    let outputFormat: OutputFormat
+    let autoEnhance: Bool
+    let aiSubjectEnhance: Bool
+    let analysisMode: AnalysisMode
+    let ollamaModel: String
+}
+
+final class RenderCancellationToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func cancel() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+}
+
+enum SceneCategory: String, Codable, CaseIterable, Sendable {
+    case portrait, event, landscape, indoor, stage, street, unknown
+}
+
+enum LightingCategory: String, Codable, CaseIterable, Sendable {
+    case daylight, overcast, indoor, stage, mixed, lowLight, unknown
+}
+
+enum RecommendedTreatment: String, Codable, CaseIterable, Sendable {
+    case minimal, globalExposure = "global_exposure", shadowLift = "shadow_lift"
+    case subjectLift = "subject_lift", preserveStageLighting = "preserve_stage_lighting", review
+}
+
+struct SceneAnalysis: Codable, Sendable {
+    let sceneCategory: SceneCategory
+    let lightingCategory: LightingCategory
+    let subjectsUnderexposed: Bool
+    let highlightsNeedProtection: Bool
+    let preserveColoredLighting: Bool
+    let recommendedTreatment: RecommendedTreatment
+}
+
+struct ImageMetrics: Sendable {
+    let luminanceP20: Double
+    let luminanceP50: Double
+    let luminanceP99: Double
+    let shadowFraction: Double
+    let highlightHeadroom: Double
+    let clippedChannelFraction: Double
+}
+
+struct EnhancementPlan: Sendable {
+    let exposureStops: Double
+    let shadowLift: Double
+    let protectHighlights: Bool
+    let preserveColor: Bool
+    let review: Bool
+}
+
+final class WorkLog: @unchecked Sendable {
+    let url: URL
+    private let lock = NSLock()
+    private var entries: [String] = []
+    private let onChange: @Sendable ([String]) -> Void
+
+    init(folder: URL, onChange: @escaping @Sendable ([String]) -> Void) {
+        url = folder.appendingPathComponent("watermark-work.log")
+        self.onChange = onChange
+    }
+
+    func add(_ message: String) {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let line = "[\(formatter.string(from: Date()))] \(message)"
+        lock.lock()
+        entries.append(line)
+        if entries.count > 200 {
+            entries.removeFirst(entries.count - 200)
+        }
+        let snapshot = entries
+        if let data = (line + "\n").data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: url.path),
+               let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                do {
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: data)
+                } catch {
+                    // The in-app log remains available if the persistent log cannot be written.
+                }
+            } else {
+                try? data.write(to: url, options: .atomic)
+            }
+        }
+        lock.unlock()
+        onChange(snapshot)
+    }
+}
+
+final class EmbeddedOllamaManager: @unchecked Sendable {
+    static let shared = EmbeddedOllamaManager()
+    static let bundledModel = "qwen3-vl:4b-instruct"
+    static let baseURL = URL(string: "http://127.0.0.1:11435")!
+
+    private let lock = NSLock()
+    private var process: Process?
+    private var runtimeLogHandle: FileHandle?
+
+    private init() {}
+
+    var runtimeLogURL: URL {
+        let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return applicationSupport
+            .appendingPathComponent("WatermarkTool", isDirectory: true)
+            .appendingPathComponent("embedded-ollama.log")
+    }
+
+    func ensureRunning(timeout: TimeInterval = 20, log: WorkLog? = nil) -> Result<URL, Error> {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if process?.isRunning == true, isHealthy() {
+            return .success(Self.baseURL)
+        }
+
+        stopLocked()
+        guard let executable = bundledExecutableURL,
+              FileManager.default.isExecutableFile(atPath: executable.path) else {
+            let error = LocalAIError.runtimeMissing
+            log?.add("Bundled AI failed to start — \(error.localizedDescription)")
+            return .failure(error)
+        }
+        guard let models = bundledModelsURL,
+              FileManager.default.fileExists(atPath: models.path) else {
+            let error = LocalAIError.bundledModelMissing
+            log?.add("Bundled AI failed to start — \(error.localizedDescription)")
+            return .failure(error)
+        }
+
+        do {
+            try prepareRuntimeLog()
+            let process = Process()
+            process.executableURL = executable
+            process.arguments = ["serve"]
+            process.currentDirectoryURL = executable.deletingLastPathComponent()
+            var environment = ProcessInfo.processInfo.environment
+            environment["OLLAMA_HOST"] = "127.0.0.1:11435"
+            environment["OLLAMA_MODELS"] = models.path
+            environment["OLLAMA_KEEP_ALIVE"] = "10m"
+            environment["OLLAMA_NUM_PARALLEL"] = "1"
+            process.environment = environment
+            process.standardOutput = runtimeLogHandle
+            process.standardError = runtimeLogHandle
+            try process.run()
+            self.process = process
+            log?.add("Bundled AI runtime started (PID \(process.processIdentifier)); runtime log: \(runtimeLogURL.path)")
+        } catch {
+            stopLocked()
+            let wrapped = LocalAIError.runtimeStartFailed(error.localizedDescription)
+            log?.add("Bundled AI failed to start — \(wrapped.localizedDescription)")
+            return .failure(wrapped)
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if process?.isRunning != true {
+                let error = LocalAIError.runtimeExited
+                log?.add("Bundled AI stopped during startup; see \(runtimeLogURL.path)")
+                stopLocked()
+                return .failure(error)
+            }
+            if isHealthy() {
+                log?.add("Bundled AI is ready on private localhost port 11435")
+                return .success(Self.baseURL)
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+
+        let error = LocalAIError.runtimeTimedOut
+        log?.add("Bundled AI startup timed out; see \(runtimeLogURL.path)")
+        stopLocked()
+        return .failure(error)
+    }
+
+    func stop() {
+        lock.lock()
+        stopLocked()
+        lock.unlock()
+    }
+
+    private var bundledExecutableURL: URL? {
+        Bundle.main.resourceURL?.appendingPathComponent("ollama")
+    }
+
+    private var bundledModelsURL: URL? {
+        Bundle.main.resourceURL?.appendingPathComponent("Models", isDirectory: true)
+    }
+
+    private func isHealthy() -> Bool {
+        var request = URLRequest(url: Self.baseURL.appendingPathComponent("api/tags"))
+        request.timeoutInterval = 1
+        let semaphore = DispatchSemaphore(value: 0)
+        let box = SynchronousDataBox()
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            box.store(data: data, statusCode: (response as? HTTPURLResponse)?.statusCode, error: error)
+            semaphore.signal()
+        }.resume()
+        guard semaphore.wait(timeout: .now() + 1) == .success,
+              box.error == nil, box.statusCode == 200, let data = box.data,
+              let tags = try? JSONDecoder().decode(OllamaTagsResponse.self, from: data) else {
+            return false
+        }
+        return tags.models.contains { $0.name == Self.bundledModel }
+    }
+
+    private func prepareRuntimeLog() throws {
+        let folder = runtimeLogURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: runtimeLogURL.path) {
+            FileManager.default.createFile(atPath: runtimeLogURL.path, contents: nil)
+        }
+        let handle = try FileHandle(forWritingTo: runtimeLogURL)
+        try handle.seekToEnd()
+        runtimeLogHandle = handle
+    }
+
+    private func stopLocked() {
+        if let process, process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
+        process = nil
+        try? runtimeLogHandle?.close()
+        runtimeLogHandle = nil
+    }
+}
+
+enum LocalAIAnalyzer {
+    static let promptVersion = "scene-analysis-v1"
+
+    static func testConnection(model: String, completion: @escaping @Sendable (Result<String, Error>) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            switch EmbeddedOllamaManager.shared.ensureRunning() {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success:
+                completion(.success("Bundled local AI is ready: \(model)."))
+            }
+        }
+    }
+
+    static func analyze(image: CGImage, file: URL, settings: RenderSettings, outputFolder: URL, metrics: ImageMetrics, log: WorkLog) -> SceneAnalysis? {
+        guard settings.analysisMode != .off else {
+            log.add("\(file.lastPathComponent): AI skipped (disabled)")
+            return nil
+        }
+        let difficult = metrics.luminanceP50 < 0.22 || metrics.highlightHeadroom < 0.06 || metrics.shadowFraction > 0.45
+        guard settings.analysisMode == .all || difficult else {
+            log.add("\(file.lastPathComponent): AI skipped (selective mode; measurements not difficult)")
+            return nil
+        }
+        let cache = AnalysisCache(folder: outputFolder)
+        let key = cacheKey(file: file, settings: settings)
+        if let cached = cache.value(for: key) {
+            log.add("\(file.lastPathComponent): AI cache hit — \(cached.sceneCategory.rawValue), \(cached.recommendedTreatment.rawValue)")
+            return cached
+        }
+        guard let preview = previewJPEG(image) else {
+            log.add("\(file.lastPathComponent): AI fallback (could not create preview)")
+            return nil
+        }
+        let request = OllamaRequest(
+            model: settings.ollamaModel.isEmpty ? EmbeddedOllamaManager.bundledModel : settings.ollamaModel,
+            prompt: "Classify this consistently developed event photograph. Return only the requested JSON. Do not suggest pixel masks or numeric edits.",
+            images: [preview.base64EncodedString()],
+            stream: false,
+            format: schema,
+            options: ["temperature": 0.0, "top_p": 0.1, "seed": 17, "num_predict": 160],
+            keepAlive: "10m"
+        )
+        guard let body = try? JSONEncoder().encode(request) else {
+            log.add("\(file.lastPathComponent): AI fallback (request encoding failed)")
+            return nil
+        }
+        let baseURL: URL
+        switch EmbeddedOllamaManager.shared.ensureRunning(log: log) {
+        case .success(let url):
+            baseURL = url
+        case .failure(let error):
+            log.add("\(file.lastPathComponent): AI unavailable — \(error.localizedDescription); using measurement-only fallback")
+            return nil
+        }
+        let endpoint = baseURL.appendingPathComponent("api/generate")
+        for attempt in 1...2 {
+            log.add("\(file.lastPathComponent): asking local AI (attempt \(attempt)/2)")
+            var urlRequest = URLRequest(url: endpoint)
+            urlRequest.httpMethod = "POST"
+            urlRequest.timeoutInterval = 180
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            urlRequest.httpBody = body
+            let semaphore = DispatchSemaphore(value: 0)
+            let responseBox = SynchronousDataBox()
+            URLSession.shared.dataTask(with: urlRequest) { data, response, error in
+                responseBox.store(data: data, statusCode: (response as? HTTPURLResponse)?.statusCode, error: error)
+                semaphore.signal()
+            }.resume()
+            guard semaphore.wait(timeout: .now() + 181) == .success else {
+                log.add("\(file.lastPathComponent): AI attempt \(attempt) timed out")
+                continue
+            }
+            if let error = responseBox.error {
+                log.add("\(file.lastPathComponent): AI attempt \(attempt) failed — \(error.localizedDescription)")
+                continue
+            }
+            guard responseBox.statusCode == 200 else {
+                log.add("\(file.lastPathComponent): AI attempt \(attempt) returned HTTP \(responseBox.statusCode ?? 0)")
+                continue
+            }
+            if let responseData = responseBox.data,
+               let response = try? JSONDecoder().decode(OllamaResponse.self, from: responseData),
+               let result = try? JSONDecoder().decode(SceneAnalysis.self, from: Data(response.response.utf8)) {
+                cache.store(result, for: key)
+                log.add("\(file.lastPathComponent): AI succeeded — \(result.sceneCategory.rawValue), \(result.lightingCategory.rawValue), \(result.recommendedTreatment.rawValue)")
+                return result
+            }
+            log.add("\(file.lastPathComponent): AI attempt \(attempt) returned invalid JSON")
+        }
+        log.add("\(file.lastPathComponent): AI unavailable; using measurement-only fallback")
+        return nil
+    }
+
+    private static let schema: [String: AnyCodable] = [
+        "type": AnyCodable("object"),
+        "properties": AnyCodable([
+            "sceneCategory": ["type": "string", "enum": SceneCategory.allCases.map(\.rawValue)],
+            "lightingCategory": ["type": "string", "enum": LightingCategory.allCases.map(\.rawValue)],
+            "subjectsUnderexposed": ["type": "boolean"],
+            "highlightsNeedProtection": ["type": "boolean"],
+            "preserveColoredLighting": ["type": "boolean"],
+            "recommendedTreatment": ["type": "string", "enum": RecommendedTreatment.allCases.map(\.rawValue)]
+        ]),
+        "required": AnyCodable(["sceneCategory", "lightingCategory", "subjectsUnderexposed", "highlightsNeedProtection", "preserveColoredLighting", "recommendedTreatment"]),
+        "additionalProperties": AnyCodable(false)
+    ]
+
+    private static func previewJPEG(_ image: CGImage) -> Data? {
+        let maxDimension = 1024.0
+        let scale = min(1, maxDimension / Double(max(image.width, image.height)))
+        let ciImage = CIImage(cgImage: image).transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        guard let preview = context.createCGImage(ciImage, from: ciImage.extent) else { return nil }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, preview, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
+    }
+
+    private static func cacheKey(file: URL, settings: RenderSettings) -> String {
+        let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        return [file.path, String(values?.fileSize ?? 0), String(describing: values?.contentModificationDate ?? .distantPast), settings.ollamaModel, promptVersion].joined(separator: "|")
+    }
+}
+
+struct AnyCodable: Codable, @unchecked Sendable {
+    let value: Any
+
+    init(_ value: Any) { self.value = value }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(String.self) { self.value = value }
+        else if let value = try? container.decode(Bool.self) { self.value = value }
+        else if let value = try? container.decode([String].self) { self.value = value }
+        else if let value = try? container.decode([String: String].self) { self.value = value }
+        else { self.value = NSNull() }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch value {
+        case let value as String: try container.encode(value)
+        case let value as Bool: try container.encode(value)
+        case let value as [String]: try container.encode(value)
+        case let value as [String: String]: try container.encode(value)
+        case let value as [String: Any]: try container.encode(value.mapValues(AnyCodable.init))
+        default: try container.encodeNil()
+        }
+    }
+}
+
+struct OllamaRequest: Encodable {
+    let model: String
+    let prompt: String
+    let images: [String]
+    let stream: Bool
+    let format: [String: AnyCodable]
+    let options: [String: Double]
+    let keepAlive: String
+
+    enum CodingKeys: String, CodingKey { case model, prompt, images, stream, format, options, keepAlive = "keep_alive" }
+}
+
+struct OllamaResponse: Decodable {
+    let response: String
+}
+
+struct OllamaTagsResponse: Decodable {
+    struct Model: Decodable {
+        let name: String
+    }
+    let models: [Model]
+}
+
+enum LocalAIError: LocalizedError {
+    case runtimeMissing
+    case bundledModelMissing
+    case runtimeStartFailed(String)
+    case runtimeExited
+    case runtimeTimedOut
+
+    var errorDescription: String? {
+        switch self {
+        case .runtimeMissing:
+            "The embedded Ollama executable is missing from this app."
+        case .bundledModelMissing:
+            "The bundled qwen3-vl:4b-instruct model is missing from this app."
+        case .runtimeStartFailed(let detail):
+            "The bundled AI runtime could not start: \(detail)"
+        case .runtimeExited:
+            "The bundled AI runtime exited during startup."
+        case .runtimeTimedOut:
+            "The bundled AI runtime did not become ready within 20 seconds."
+        }
+    }
+}
+
+final class SynchronousDataBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedData: Data?
+    private var storedStatusCode: Int?
+    private var storedError: Error?
+
+    var data: Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedData
+    }
+
+    var statusCode: Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedStatusCode
+    }
+
+    var error: Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedError
+    }
+
+    func store(data: Data?, statusCode: Int?, error: Error?) {
+        lock.lock()
+        storedData = data
+        storedStatusCode = statusCode
+        storedError = error
+        lock.unlock()
+    }
+}
+
+struct AnalysisCacheFile: Codable {
+    var values: [String: SceneAnalysis] = [:]
+}
+
+struct RenderStatusEntry: Codable {
+    let fingerprint: String
+    let outputName: String
+}
+
+final class RenderStatusStore: @unchecked Sendable {
+    private let url: URL
+    private var entries: [String: RenderStatusEntry]
+
+    init(folder: URL) {
+        url = folder.appendingPathComponent(".watermark-status.json")
+        entries = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode([String: RenderStatusEntry].self, from: $0) } ?? [:]
+    }
+
+    func isComplete(file: URL, settings: RenderSettings) -> Bool {
+        guard let entry = entries[file.path], entry.fingerprint == fingerprint(file: file, settings: settings) else { return false }
+        return FileManager.default.fileExists(atPath: url.deletingLastPathComponent().appendingPathComponent(entry.outputName).path)
+    }
+
+    func markComplete(file: URL, settings: RenderSettings, output: URL) {
+        entries[file.path] = RenderStatusEntry(fingerprint: fingerprint(file: file, settings: settings), outputName: output.lastPathComponent)
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private func fingerprint(file: URL, settings: RenderSettings) -> String {
+        let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        return [String(values?.fileSize ?? 0), String(describing: values?.contentModificationDate ?? .distantPast), settings.text, settings.fontName, settings.corner.rawValue, settings.direction.rawValue, String(settings.opacity), String(settings.heightPercent), String(settings.bottomOffsetPercent), String(settings.jpegQuality), settings.outputFormat.rawValue, String(settings.autoEnhance), String(settings.aiSubjectEnhance), settings.analysisMode.rawValue, settings.ollamaModel].joined(separator: "|")
+    }
+}
+
+final class AnalysisCache {
+    private let url: URL
+    private var file: AnalysisCacheFile
+
+    init(folder: URL) {
+        url = folder.appendingPathComponent(".watermark-ai-cache.json")
+        file = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(AnalysisCacheFile.self, from: $0) } ?? AnalysisCacheFile()
+    }
+
+    func value(for key: String) -> SceneAnalysis? { file.values[key] }
+
+    func store(_ value: SceneAnalysis, for key: String) {
+        file.values[key] = value
+        guard let data = try? JSONEncoder().encode(file) else { return }
+        let temporary = url.deletingLastPathComponent().appendingPathComponent(".watermark-ai-cache-\(UUID().uuidString).tmp")
+        try? data.write(to: temporary, options: .atomic)
+        if FileManager.default.fileExists(atPath: url.path) {
+            _ = try? FileManager.default.replaceItemAt(url, withItemAt: temporary)
+        } else {
+            try? FileManager.default.moveItem(at: temporary, to: url)
+        }
+    }
+}
+
+enum MeasurementEnhancer {
+    static func measure(_ image: CGImage) -> ImageMetrics {
+        guard let providerData = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(providerData) else {
+            return ImageMetrics(luminanceP20: 0.5, luminanceP50: 0.5, luminanceP99: 0.9, shadowFraction: 0, highlightHeadroom: 0.1, clippedChannelFraction: 0)
+        }
+        let bytesPerPixel = max(1, image.bitsPerPixel / 8)
+        let samplesPerRow = max(1, image.width / 512)
+        let samplesPerColumn = max(1, image.height / 512)
+        var luminances: [Double] = []
+        var clippedChannels = 0
+        var channelCount = 0
+        for y in stride(from: 0, to: image.height, by: samplesPerColumn) {
+            for x in stride(from: 0, to: image.width, by: samplesPerRow) {
+                let offset = y * image.bytesPerRow + x * bytesPerPixel
+                let red = Double(bytes[offset]) / 255
+                let green = Double(bytes[offset + min(1, bytesPerPixel - 1)]) / 255
+                let blue = Double(bytes[offset + min(2, bytesPerPixel - 1)]) / 255
+                luminances.append(0.2126 * red + 0.7152 * green + 0.0722 * blue)
+                for channel in 0..<min(3, bytesPerPixel) {
+                    channelCount += 1
+                    if bytes[offset + channel] >= 254 { clippedChannels += 1 }
+                }
+            }
+        }
+        guard !luminances.isEmpty else {
+            return ImageMetrics(luminanceP20: 0.5, luminanceP50: 0.5, luminanceP99: 0.9, shadowFraction: 0, highlightHeadroom: 0.1, clippedChannelFraction: 0)
+        }
+        luminances.sort()
+        func percentile(_ percentile: Double) -> Double {
+            luminances[min(luminances.count - 1, Int(Double(luminances.count - 1) * percentile))]
+        }
+        return ImageMetrics(
+            luminanceP20: percentile(0.20),
+            luminanceP50: percentile(0.50),
+            luminanceP99: percentile(0.99),
+            shadowFraction: Double(luminances.filter { $0 < 0.12 }.count) / Double(luminances.count),
+            highlightHeadroom: max(0, 1 - percentile(0.99)),
+            clippedChannelFraction: channelCount == 0 ? 0 : Double(clippedChannels) / Double(channelCount)
+        )
+    }
+
+    static func plan(metrics: ImageMetrics, analysis: SceneAnalysis?) -> EnhancementPlan {
+        let treatment = analysis?.recommendedTreatment
+        let preserveColor = analysis?.preserveColoredLighting == true || treatment == .preserveStageLighting
+        let protectHighlights = metrics.highlightHeadroom < 0.04 || analysis?.highlightsNeedProtection == true
+        let globallyDark = metrics.luminanceP50 < 0.22 && metrics.luminanceP99 < 0.92
+        let requestedGlobal = treatment == .globalExposure || (analysis == nil && globallyDark)
+        let exposure = requestedGlobal && !protectHighlights ? min(0.35, max(0, (0.30 - metrics.luminanceP50) * 1.3)) : 0
+        let requestedShadows = treatment == .shadowLift || treatment == .subjectLift || analysis == nil
+        let noisyShadows = metrics.shadowFraction > 0.65 && metrics.luminanceP20 < 0.04
+        let shadowLift = requestedShadows && !noisyShadows ? min(0.28, max(0, (0.16 - metrics.luminanceP20) * 1.4)) : 0
+        return EnhancementPlan(exposureStops: exposure, shadowLift: shadowLift, protectHighlights: protectHighlights, preserveColor: preserveColor, review: treatment == .review || metrics.clippedChannelFraction > 0.18)
+    }
+}
+
+enum ImageRenderer {
+    static func render(file: URL, to folder: URL, settings: RenderSettings, log: WorkLog) throws -> URL {
+                guard let source = CGImageSourceCreateWithURL(file as CFURL, nil),
+              let sourceImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+                let sourceProperties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] ?? [:]
+        let developedImage = try preparedImage(file: file, sourceImage: sourceImage, settings: settings)
+        let metrics = MeasurementEnhancer.measure(developedImage)
+        let analysis = LocalAIAnalyzer.analyze(image: developedImage, file: file, settings: settings, outputFolder: folder, metrics: metrics, log: log)
+        let plan = MeasurementEnhancer.plan(metrics: metrics, analysis: analysis)
+        let shouldMeasureEnhance = settings.autoEnhance && !(isRaw(file) && rawTherapeeURL() != nil)
+        let image = try measuredEnhancedImage(developedImage, plan: plan, enabled: shouldMeasureEnhance)
+        let width = CGFloat(image.width)
+        let height = CGFloat(image.height)
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        guard let context = CGContext(data: nil, width: image.width, height: image.height, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        let fontSize = max(8, height * settings.heightPercent / 100)
+        let font = NSFont(name: settings.fontName, size: fontSize) ?? .systemFont(ofSize: fontSize)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.white.withAlphaComponent(settings.opacity),
+            .strokeColor: NSColor.black.withAlphaComponent(settings.opacity * 0.65),
+            .strokeWidth: -2.5
+        ]
+        let string = NSAttributedString(string: settings.text, attributes: attributes)
+        let textSize = string.size()
+        let margin = max(12, height * 0.025)
+        let bottomOffset = height * settings.bottomOffsetPercent / 100
+        let origin: CGPoint
+        switch settings.corner {
+        case .topLeft: origin = CGPoint(x: margin, y: height - margin - textSize.height)
+        case .topRight: origin = CGPoint(x: width - margin - textSize.width, y: height - margin - textSize.height)
+        case .bottomLeft: origin = CGPoint(x: margin, y: margin + bottomOffset)
+        case .bottomRight: origin = CGPoint(x: width - margin - textSize.width, y: margin + bottomOffset)
+        }
+        let center = CGPoint(x: origin.x + textSize.width / 2, y: origin.y + textSize.height / 2)
+        let graphicsContext = NSGraphicsContext(cgContext: context, flipped: false)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = graphicsContext
+        context.saveGState()
+        context.translateBy(x: center.x, y: center.y)
+        context.rotate(by: settings.direction.angle)
+        string.draw(at: CGPoint(x: -textSize.width / 2, y: -textSize.height / 2))
+        context.restoreGState()
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let result = context.makeImage(), let type = outputType(for: file, format: settings.outputFormat) else { throw CocoaError(.coderInvalidValue) }
+        let outputURL = uniqueOutputURL(for: file, in: folder, type: type)
+        let temporaryURL = folder.appendingPathComponent(".watermark-\(UUID().uuidString).tmp")
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        guard let destination = CGImageDestinationCreateWithURL(temporaryURL as CFURL, type.identifier as CFString, 1, nil) else { throw CocoaError(.fileWriteUnknown) }
+        var properties = sourceProperties
+        if type == .jpeg { properties[kCGImageDestinationLossyCompressionQuality] = settings.jpegQuality }
+        CGImageDestinationAddImage(destination, result, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw CocoaError(.fileWriteUnknown) }
+        try FileManager.default.moveItem(at: temporaryURL, to: outputURL)
+        return outputURL
+    }
+
+    private static func outputType(for file: URL, format: OutputFormat) -> UTType? {
+        if format == .jpeg { return UTType.jpeg }
+        return switch file.pathExtension.lowercased() {
+        case "jpg", "jpeg": UTType.jpeg
+        case "png": UTType.png
+        case "tif", "tiff": UTType.tiff
+        case "heic", "heif": UTType.heic
+        default: nil
+        }
+    }
+
+    private static func measuredEnhancedImage(_ image: CGImage, plan: EnhancementPlan, enabled: Bool) throws -> CGImage {
+        guard enabled else { return image }
+        let input = CIImage(cgImage: image)
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        var output = input
+        if plan.exposureStops > 0, let exposure = CIFilter(name: "CIExposureAdjust") {
+            exposure.setValue(output, forKey: kCIInputImageKey)
+            exposure.setValue(plan.exposureStops, forKey: kCIInputEVKey)
+            output = exposure.outputImage ?? output
+        }
+        if let shadows = CIFilter(name: "CIHighlightShadowAdjust") {
+            shadows.setValue(output, forKey: kCIInputImageKey)
+            shadows.setValue(plan.shadowLift, forKey: "inputShadowAmount")
+            shadows.setValue(plan.protectHighlights ? 0.28 : 0.06, forKey: "inputHighlightAmount")
+            output = shadows.outputImage ?? output
+        }
+        guard let enhanced = context.createCGImage(output, from: output.extent) else {
+            throw CocoaError(.coderInvalidValue)
+        }
+        return enhanced
+    }
+
+    private static func autoAdjustedImage(_ input: CIImage) -> CIImage {
+        var output = input
+        for filter in input.autoAdjustmentFilters(options: nil) {
+            filter.setValue(output, forKey: kCIInputImageKey)
+            if let filtered = filter.outputImage {
+                output = filtered
+            }
+        }
+        return output
+    }
+
+    private static func preparedImage(file: URL, sourceImage: CGImage, settings: RenderSettings) throws -> CGImage {
+        var image = sourceImage
+        if settings.autoEnhance && isRaw(file), let rawTherapee = rawTherapeeURL() {
+            image = try rawTherapeeImage(file: file, sourceImage: sourceImage, executable: rawTherapee)
+        }
+        if settings.aiSubjectEnhance {
+            image = try subjectEnhancedImage(image)
+        }
+        return image
+    }
+
+    private static func rawTherapeeImage(file: URL, sourceImage: CGImage, executable: URL) throws -> CGImage {
+
+        let temporaryFolder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WatermarkTool-RAW-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: temporaryFolder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: temporaryFolder) }
+
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = ["-q", "-d", "-j100", "-o", temporaryFolder.path, "-Y", "-c", file.path]
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0,
+              let renderedURL = try? FileManager.default.contentsOfDirectory(at: temporaryFolder, includingPropertiesForKeys: nil).first(where: { $0.pathExtension.lowercased() == "jpg" }),
+              let renderedSource = CGImageSourceCreateWithURL(renderedURL as CFURL, nil),
+              let renderedImage = CGImageSourceCreateImageAtIndex(renderedSource, 0, nil) else {
+            return sourceImage
+        }
+        return renderedImage
+    }
+
+    private static func subjectEnhancedImage(_ image: CGImage) throws -> CGImage {
+        let handler = VNImageRequestHandler(cgImage: image)
+        let request = VNGenerateForegroundInstanceMaskRequest()
+        try handler.perform([request])
+        guard let observation = request.results?.first else { return image }
+        let maskBuffer = try observation.generateScaledMaskForImage(forInstances: observation.allInstances, from: handler)
+        let original = CIImage(cgImage: image)
+        let adjusted = autoAdjustedImage(original)
+        guard let blend = CIFilter(name: "CIBlendWithMask") else { return image }
+        blend.setValue(adjusted, forKey: kCIInputImageKey)
+        blend.setValue(original, forKey: kCIInputBackgroundImageKey)
+        blend.setValue(CIImage(cvPixelBuffer: maskBuffer), forKey: kCIInputMaskImageKey)
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        guard let output = blend.outputImage,
+              let result = context.createCGImage(output, from: original.extent) else {
+            return image
+        }
+        return result
+    }
+
+    private static func rawTherapeeURL() -> URL? {
+        [
+            "/opt/homebrew/bin/rawtherapee-cli",
+            "/usr/local/bin/rawtherapee-cli",
+            "/Applications/RawTherapee.app/Contents/MacOS/rawtherapee-cli"
+        ].lazy.map(URL.init(fileURLWithPath:)).first(where: { FileManager.default.isExecutableFile(atPath: $0.path) })
+    }
+
+    private static func uniqueOutputURL(for file: URL, in folder: URL, type: UTType) -> URL {
+        let stem = file.deletingPathExtension().lastPathComponent + "-watermarked"
+        let extensionName = type.preferredFilenameExtension ?? "jpg"
+        var candidate = folder.appendingPathComponent("\(stem).\(extensionName)")
+        var suffix = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = folder.appendingPathComponent("\(stem)-\(suffix).\(extensionName)")
+            suffix += 1
+        }
+        return candidate
+    }
+
+    private static func isRaw(_ file: URL) -> Bool {
+        ["dng", "raw", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2"].contains(file.pathExtension.lowercased())
+    }
+}

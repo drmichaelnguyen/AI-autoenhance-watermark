@@ -1,0 +1,9 @@
+.DS_Store
+.build/
+.packaging-cache/
+dist/
+WatermarkTool.app/
+*.tmp
+.watermark-status.json
+.watermark-ai-cache.json
+watermark-work.log
